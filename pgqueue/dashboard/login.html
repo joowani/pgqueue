@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in | PGQueue</title>
+  <link rel="icon" type="image/svg+xml" href="{root}/static/favicon.svg?v={version}">
+  <link rel="stylesheet" href="{root}/static/pico.min.css?v={version}">
+  <link rel="stylesheet" href="{root}/static/login.css?v={version}">
+</head>
+<body>
+  <main>
+    <article>
+      <h1>
+        <img class="login-logo" src="{root}/static/favicon.svg?v={version}" alt="" width="24" height="24"
+             aria-hidden="true">
+        <span>PGQueue</span>
+      </h1>
+      <p class="error" role="alert">{error}</p>
+      <form method="post" action="{root}/login">
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username"
+               autocapitalize="none" spellcheck="false" required autofocus>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password"
+               autocomplete="current-password" required>
+        <button type="submit">Sign in</button>
+      </form>
+    </article>
+  </main>
+</body>
+</html>

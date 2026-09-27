@@ -1,0 +1,9 @@
+# https://rust-lang.github.io/rustup/overrides.html#the-toolchain-file
+[toolchain]
+# Nightly is required for unstable flags such as `cargo llvm-cov --doctests` and `cargo clean gc -Zgc`. Pinned to a
+# date rather than floating, because `shell/scripts/check` denies all warnings: on a floating channel a new lint in that
+# day's nightly fails the build for whoever happens to `rustup update` first. Keep this file the same in every project
+# and bump the date in all of them at once.
+channel = "nightly-2026-08-13"
+profile = "minimal"
+components = ["clippy", "llvm-tools-preview", "rustfmt"]

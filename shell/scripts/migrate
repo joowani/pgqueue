@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+cd "${BASH_SOURCE[0]%/*}/../.."
+export DATABASE_URL="${DATABASE_URL:-postgres://pgqueue:pgqueue@localhost:3532/pgqueue}"
+
+docker compose up -d --wait postgres
+
+# Call `sqlx` directly rather than `cargo sqlx` to skip cargo's startup.
+sqlx migrate run --config pgqueue/sqlx.toml --source pgqueue/migrations

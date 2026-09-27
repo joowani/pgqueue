@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+cd "${BASH_SOURCE[0]%/*}/../.."
+
+# Enforce NNNN_migration.sql numbering so two branches cannot claim the same version.
+shopt -s nullglob
+expected=1
+for path in pgqueue/migrations/*.sql; do
+    name="$(printf '%04d_migration.sql' "$expected")"
+    if [[ ${path##*/} != "$name" ]]; then
+        echo "$path: migration must be named $name" >&2
+        exit 1
+    fi
+    expected=$((expected + 1))
+done
+
+# Markdown prose must fit in 120 characters. Code blocks and table rows are skipped because they cannot wrap.
+# Perl counts characters rather than bytes, so non-ASCII text such as Korean is measured correctly.
+git ls-files -z '*.md' | xargs -0 perl -CSD -lne '
+  if (/^\s*(```|~~~)/) { $fenced = !$fenced; next }
+  if (!$fenced && !/^\s*\|/ && length > 120) { print "$ARGV:$.: line is ", length, " characters (max 120)"; $bad = 1 }
+  END { exit $bad }
+} continue { if (eof) { close ARGV; $fenced = 0 }'
+
+# Cargo never removes stale artifacts, so the target directory only grows. Past the size limit, start it over and let
+# clippy rebuild what it needs. Set CARGO_TARGET_LIMIT_GB to change the limit.
+limit_gb="${CARGO_TARGET_LIMIT_GB:-20}"
+size_kb="$({ du -sk target || true; } 2> /dev/null | awk '{ print $1 }')"
+if (( ${size_kb:-0} > limit_gb * 1024 * 1024 )); then
+    printf 'target is %d GB, over the %d GB limit: cleaning it\n' $(( size_kb / 1024 / 1024 )) "${limit_gb}"
+    cargo clean
+fi
+
+cargo fmt --all -- --check
+cargo audit --deny yanked
+
+# Lint the published build separately, since compiling tests enables a test-only feature users never get.
+cargo clippy --locked --quiet --workspace --lib --bins -- -D warnings
+cargo clippy --locked --quiet --workspace --all-targets --all-features -- -D warnings

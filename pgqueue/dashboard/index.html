@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="pgqueue-root" content="{root}">
+  <meta name="pgqueue-user" content="{username}">
+  <meta name="pgqueue-auth-enabled" content="{auth_enabled}">
+  <title>PGQueue</title>
+  <link rel="icon" type="image/svg+xml" href="{root}/static/favicon.svg?v={version}">
+  <link rel="stylesheet" href="{root}/static/pico.min.css?v={version}">
+  <link rel="stylesheet" href="{root}/static/app.css?v={version}">
+</head>
+<body>
+  <main id="app">
+    <article aria-busy="true">Loading...</article>
+  </main>
+  <script type="module" src="{root}/static/app.mjs?v={version}"></script>
+</body>
+</html>

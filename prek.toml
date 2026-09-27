@@ -1,0 +1,56 @@
+# Configuration for `prek` (https://prek.j178.dev), run before every commit and in CI.
+# Schema: https://www.schemastore.org/prek.json
+minimum_prek_version = "0.4.0"
+default_install_hook_types = ["pre-commit"]
+
+# Hooks run cheapest first and the run stops at the first failure, so a commit that is already going to be rejected
+# never pays for a full test run.
+fail_fast = true
+
+# Vendored, minified files are not ours to reformat.
+exclude = '\.min\.(css|js)$'
+
+[[repos]]
+repo = "builtin"
+hooks = [
+    { id = "trailing-whitespace" },
+    { id = "end-of-file-fixer" },
+    { id = "mixed-line-ending", args = ["--fix=lf"] },
+    { id = "check-merge-conflict" },
+    { id = "check-added-large-files", args = ["--maxkb=1024"] },
+    { id = "detect-private-key" },
+    { id = "check-json" },
+    { id = "check-toml" },
+    # pnpm lockfiles can hold two YAML documents: the pinned pnpm itself, then the dependencies.
+    { id = "check-yaml", args = ["--allow-multiple-documents"] },
+    { id = "check-case-conflict" },
+    { id = "destroyed-symlinks" },
+]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "check"
+name = "run checks"
+entry = "shell/scripts/check"
+language = "system"
+always_run = true
+pass_filenames = false
+
+# The test and stress hooks skip themselves unless `CI` is set, to keep commits under 30 seconds.
+[[repos.hooks]]
+id = "test"
+name = "run tests"
+entry = "shell/scripts/test"
+language = "system"
+always_run = true
+pass_filenames = false
+
+[[repos.hooks]]
+id = "stress"
+name = "run stress tests"
+entry = "shell/scripts/stress"
+language = "system"
+always_run = true
+pass_filenames = false

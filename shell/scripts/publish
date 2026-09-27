@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+cd "${BASH_SOURCE[0]%/*}/../.."
+
+# Publishes both crates, then tags the commit and creates the GitHub release. Needs `gh` signed in, or `GH_TOKEN` in CI.
+# `--check` validates the version and stops, so the release workflow can reject a bad input before running the tests.
+check_only=false
+if [[ ${1:-} == --check ]]; then
+    check_only=true
+    shift
+fi
+
+version="${1:?usage: shell/scripts/publish [--check] <version>}"
+
+# Require a bare `x.y.z`, so neither a tag-shaped `v1.2.3` nor a pre-release suffix reaches `cargo publish`.
+if [[ ! $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    echo "version $version is not a bare x.y.z number" >&2
+    exit 1
+fi
+
+workspace_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+if [[ $version != "$workspace_version" ]]; then
+    echo "requested version $version does not match the workspace version $workspace_version" >&2
+    exit 1
+fi
+
+# `{owner}/{repo}` resolves from `GH_REPO` or the `origin` remote, so this works both locally and in Actions.
+commit="$(git rev-parse HEAD)"
+default_branch="$(gh api 'repos/{owner}/{repo}' --jq .default_branch)"
+
+# Release only commits already on the default branch, so a local run cannot publish unpushed or feature-branch code.
+if ! status="$(gh api "repos/{owner}/{repo}/compare/$default_branch...$commit" --jq .status 2>/dev/null)" ||
+    [[ $status != identical && $status != behind ]]; then
+    echo "commit $commit is not on the GitHub $default_branch branch; push it first" >&2
+    exit 1
+fi
+
+# An existing tag must already point at this commit. Only a 404 means the tag is absent; any other failure is fatal.
+if tag_ref_response="$(gh api --include "repos/{owner}/{repo}/git/ref/tags/v$version" 2>&1)"; then
+    if ! tag_commit="$(gh api "repos/{owner}/{repo}/commits/v$version" --jq .sha)"; then
+        echo "tag v$version exists but its commit could not be resolved" >&2
+        exit 1
+    fi
+    if [[ $tag_commit != "$commit" ]]; then
+        echo "tag v$version points to $tag_commit instead of $commit" >&2
+        exit 1
+    fi
+    tag_exists=true
+elif grep -qE '^HTTP/[0-9.]+ 404 ' <<<"$tag_ref_response"; then
+    tag_exists=false
+else
+    echo "GitHub could not confirm whether tag v$version exists" >&2
+    printf '%s\n' "$tag_ref_response" >&2
+    exit 1
+fi
+
+if [[ $check_only == true ]]; then
+    exit 0
+fi
+
+user_agent="pgqueue release workflow (https://github.com/joowani/pgqueue)"
+
+# Read the status code, since `curl --fail` cannot tell a network failure from a 404.
+crate_exists() {
+    local status
+    status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+        --user-agent "$user_agent" "https://crates.io/api/v1/crates/$1/$version")" || {
+        echo "crates.io could not be reached while checking $1 $version" >&2
+        exit 1
+    }
+    case "$status" in
+        200) return 0 ;;
+        404) return 1 ;;
+        *)
+            echo "crates.io answered $status while checking $1 $version" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# Publish both crates in dependency order; `publish.timeout` raises cargo's 60s index wait to 300s.
+publish_timeout=(-Z publish-timeout --config publish.timeout=300)
+if ! crate_exists pgqueue-macros; then
+    cargo publish --workspace --locked "${publish_timeout[@]}"
+elif ! crate_exists pgqueue; then
+    cargo publish --locked -p pgqueue "${publish_timeout[@]}"
+else
+    echo "both crates are already published at $version; nothing to do"
+fi
+
+# Every step is idempotent, so a run that failed partway can simply be repeated.
+if gh release view "v$version" >/dev/null 2>&1; then
+    echo "release v$version already exists; nothing to do"
+elif [[ $tag_exists == true ]]; then
+    gh release create "v$version" --verify-tag --title "v$version" --generate-notes
+else
+    gh release create "v$version" --target "$commit" --title "v$version" --generate-notes
+fi

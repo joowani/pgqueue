@@ -1,0 +1,37 @@
+name: pgqueue
+
+services:
+  postgres:
+    container_name: pgqueue-postgres
+    image: postgres:18.4-alpine
+    environment:
+      POSTGRES_USER: pgqueue
+      POSTGRES_PASSWORD: pgqueue
+      POSTGRES_DB: pgqueue
+    ports:
+      # These are guessable development credentials, so bind them to loopback
+      # rather than publishing them on every interface.
+      - "127.0.0.1:${PGQUEUE_POSTGRES_PORT:-3532}:5432"
+    # The three durability settings below trade crash safety for test speed and
+    # make this database deliberately non-durable: a commit is acknowledged
+    # before its WAL record is on disk, so killing the container loses
+    # transactions it already confirmed (measured at 3,263 of them for one
+    # SIGKILL). That is fine for a suite that recreates its schema per test, and
+    # it is exactly wrong in production, where it voids the at-least-once
+    # delivery guarantee. A crash-recovery test must set
+    # `synchronous_commit = on` for its own database before it can assert
+    # anything.
+    command: >-
+      postgres
+      -c fsync=off
+      -c synchronous_commit=off
+      -c full_page_writes=off
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c pg_stat_statements.max=20000
+      -c max_connections=300
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgqueue"]
+      interval: 1s
+      timeout: 3s
+      retries: 30

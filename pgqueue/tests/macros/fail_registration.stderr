@@ -1,0 +1,74 @@
+error[E0277]: the trait bound `scheduled: JobDefinition` is not satisfied
+ --> tests/macros/fail_registration.rs:8:34
+  |
+8 |     let _ = builder.register_job(scheduled);
+  |                     ------------ ^^^^^^^^^ unsatisfied trait bound
+  |                     |
+  |                     required by a bound introduced by this call
+  |
+help: the trait `JobDefinition` is not implemented for `scheduled`
+ --> tests/macros/fail_registration.rs:4:1
+  |
+4 | #[pgqueue::cron("* * * * *")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: the trait `JobDefinition` is implemented for `ordinary`
+ --> tests/macros/fail_registration.rs:1:1
+  |
+1 | #[pgqueue::job]
+  | ^^^^^^^^^^^^^^^
+note: required by a bound in `WorkerBuilder::register_job`
+ --> src/worker.rs
+  |
+  |     pub fn register_job<J: JobDefinition>(mut self, _job: J) -> Self {
+  |                            ^^^^^^^^^^^^^ required by this bound in `WorkerBuilder::register_job`
+  = note: this error originates in the attribute macro `pgqueue::cron` which comes from the expansion of the attribute macro `pgqueue::job` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `ordinary: CronDefinition` is not satisfied
+  --> tests/macros/fail_registration.rs:12:35
+   |
+12 |     let _ = builder.register_cron(ordinary);
+   |                     ------------- ^^^^^^^^ unsatisfied trait bound
+   |                     |
+   |                     required by a bound introduced by this call
+   |
+help: the trait `CronDefinition` is not implemented for `ordinary`
+  --> tests/macros/fail_registration.rs:1:1
+   |
+ 1 | #[pgqueue::job]
+   | ^^^^^^^^^^^^^^^
+help: the trait `CronDefinition` is implemented for `scheduled`
+  --> tests/macros/fail_registration.rs:4:1
+   |
+ 4 | #[pgqueue::cron("* * * * *")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `WorkerBuilder::register_cron`
+  --> src/worker.rs
+   |
+   |     pub fn register_cron<J: CronDefinition>(mut self, _cron: J) -> Self {
+   |                             ^^^^^^^^^^^^^^ required by this bound in `WorkerBuilder::register_cron`
+   = note: this error originates in the attribute macro `pgqueue::job` which comes from the expansion of the attribute macro `pgqueue::cron` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `scheduled: JobDefinition` is not satisfied
+  --> tests/macros/fail_registration.rs:16:48
+   |
+16 |     let _ = builder.schedule_cron("* * * * *", scheduled::job());
+   |                     -------------              ^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |                     |
+   |                     required by a bound introduced by this call
+   |
+help: the trait `JobDefinition` is not implemented for `scheduled`
+  --> tests/macros/fail_registration.rs:4:1
+   |
+ 4 | #[pgqueue::cron("* * * * *")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: the trait `JobDefinition` is implemented for `ordinary`
+  --> tests/macros/fail_registration.rs:1:1
+   |
+ 1 | #[pgqueue::job]
+   | ^^^^^^^^^^^^^^^
+note: required by a bound in `WorkerBuilder::schedule_cron`
+  --> src/worker.rs
+   |
+   |     pub fn schedule_cron<J: JobDefinition>(self, expr: &str, job: JobBuilder<J>) -> Self {
+   |                             ^^^^^^^^^^^^^ required by this bound in `WorkerBuilder::schedule_cron`
+   = note: this error originates in the attribute macro `pgqueue::cron` which comes from the expansion of the attribute macro `pgqueue::job` (in Nightly builds, run with -Z macro-backtrace for more info)

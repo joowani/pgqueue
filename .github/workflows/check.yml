@@ -1,0 +1,39 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 26
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install --no-self-update
+
+      - name: Install dev tools
+        uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2.86.1
+        with:
+          tool: cargo-audit@0.22.2,cargo-llvm-cov@0.8.7,prek@0.4.13,sqlx-cli@0.9.0
+
+      # This is the same command the prek commit hook runs locally. GitHub Actions sets `CI`, which makes the test and
+      # stress hooks run instead of skipping. Keep every check in prek.toml so local and CI validation cannot drift
+      # apart.
+      - name: Run repository checks
+        run: prek run --all-files
