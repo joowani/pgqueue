@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# The dashboard's JavaScript tests take well under a second, so they run on every commit, ahead of the CI gate below.
+node --test "${BASH_SOURCE[0]%/*}/../../pgqueue/tests/dashboard/app.test.mjs"
+
+# The commit hook has to stay fast, so outside CI the Rust suite runs only on request, as in `CI=1 shell/scripts/test`.
+if [[ -z ${CI:-} ]]; then
+    echo "test: skipped because CI is not set; run \`CI=1 shell/scripts/test\` to run it locally" >&2
+    exit 0
+fi
+
+# Source rather than run, to reuse its `DATABASE_URL` and its `cd` to the repository root.
+source "${BASH_SOURCE[0]%/*}/migrate"
+
+# Reset the query-count table, which fills with dead test databases and then evicts rows the tests measure against.
+psql "$DATABASE_URL" -Atc "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
+
+# Each SQLx test owns its database, so the cases run in parallel, one per CPU. Tests with timing assertions must leave
+# room for a machine busy with the rest of the suite. Forward arguments so a run can be narrowed, as in
+# `CI=1 shell/scripts/test dedupe`. The `#[ignore]`d stress tier runs through `shell/scripts/stress`.
+cargo llvm-cov --locked --quiet --workspace --all-features --doctests --fail-under-lines 90 -- "$@"

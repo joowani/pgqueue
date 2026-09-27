@@ -1,0 +1,16 @@
+# https://rust-lang.github.io/rustfmt/?version=master&search=#edition
+edition = "2024"
+# https://rust-lang.github.io/rustfmt/?version=master&search=#array_width
+array_width = 60
+# https://rust-lang.github.io/rustfmt/?version=master&search=#max_width
+max_width = 120
+# https://rust-lang.github.io/rustfmt/?version=master&search=#fn_params_layout
+fn_params_layout = "Tall"
+# https://rust-lang.github.io/rustfmt/?version=master&search=#short_array_element_width_threshold
+short_array_element_width_threshold = 5
+# https://rust-lang.github.io/rustfmt/?version=master&search=#reorder_imports
+reorder_imports = true
+# https://rust-lang.github.io/rustfmt/?version=master&search=#reorder_modules
+reorder_modules = true
+# https://rust-lang.github.io/rustfmt/?version=master&search=#use_small_heuristics
+use_small_heuristics = "Max"

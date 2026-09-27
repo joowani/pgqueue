@@ -1,0 +1,470 @@
+error: expected an unsuffixed integer literal
+ --> tests/macros/fail.rs:1:29
+  |
+1 | #[pgqueue::job(timeout_ms = "30000")]
+  |                             ^^^^^^^
+
+error: max_attempts must be between 1 and 2147483646
+ --> tests/macros/fail.rs:4:31
+  |
+4 | #[pgqueue::job(max_attempts = 2147483647)]
+  |                               ^^^^^^^^^^
+
+error: timeout_ms exceeds pgqueue's maximum supported duration
+ --> tests/macros/fail.rs:7:29
+  |
+7 | #[pgqueue::job(timeout_ms = 18446744073709551616)]
+  |                             ^^^^^^^^^^^^^^^^^^^^
+
+error: revision must fit in PostgreSQL bigint
+  --> tests/macros/fail.rs:10:41
+   |
+10 | #[pgqueue::cron("* * * * *", revision = 9223372036854775808)]
+   |                                         ^^^^^^^^^^^^^^^^^^^
+
+error: exponential backoff requires retry_delay_ms greater than zero
+  --> tests/macros/fail.rs:13:16
+   |
+13 | #[pgqueue::job(max_backoff_ms = 1)]
+   |                ^^^^^^^^^^^^^^
+
+error: unknown attribute `max_attempt`; expected one of: name, max_attempts, timeout_ms, result_ttl_ms, failed_ttl_ms, retry_delay_ms, max_backoff_ms, priority
+  --> tests/macros/fail.rs:16:16
+   |
+16 | #[pgqueue::job(max_attempt = 3)]
+   |                ^^^^^^^^^^^
+
+error: `revision` is only valid on #[pgqueue::cron]
+  --> tests/macros/fail.rs:19:16
+   |
+19 | #[pgqueue::job(revision = 1)]
+   |                ^^^^^^^^
+
+error: #[pgqueue::job] functions need a payload as their first parameter; use `_: ()` for jobs without one
+  --> tests/macros/fail.rs:23:10
+   |
+23 | async fn no_payload() {}
+   |          ^^^^^^^^^^
+
+error: #[pgqueue::job] functions must be async
+  --> tests/macros/fail.rs:26:1
+   |
+26 | fn not_async(_: ()) {}
+   | ^^
+
+error: #[pgqueue::job] functions cannot be unsafe
+  --> tests/macros/fail.rs:29:7
+   |
+29 | async unsafe fn unsafe_job(_: ()) {}
+   |       ^^^^^^
+
+error: #[pgqueue::cron] functions cannot be unsafe
+  --> tests/macros/fail.rs:32:7
+   |
+32 | async unsafe fn unsafe_cron() {}
+   |       ^^^^^^
+
+error: #[pgqueue::job] functions cannot declare an ABI
+  --> tests/macros/fail.rs:37:7
+   |
+37 | async extern "C" fn abi_job(_: ()) {}
+   |       ^^^^^^^^^^
+
+error: #[pgqueue::job] functions cannot be generic
+  --> tests/macros/fail.rs:40:17
+   |
+40 | async fn generic<T: serde::de::DeserializeOwned>(args: T) {
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: #[pgqueue::job] functions cannot use `impl Trait` in argument position; use a concrete type
+  --> tests/macros/fail.rs:45:28
+   |
+45 | async fn impl_trait_job(_: impl serde::Serialize) {}
+   |                            ^^^^^^^^^^^^^^^^^^^^^
+
+error: #[pgqueue::cron] functions cannot use `impl Trait` in argument position; use a concrete type
+  --> tests/macros/fail.rs:48:29
+   |
+48 | async fn impl_trait_cron(_: impl Send) {}
+   |                             ^^^^^^^^^
+
+error: #[pgqueue::job] functions cannot use `impl Trait` in return position; use a concrete type
+  --> tests/macros/fail.rs:51:38
+   |
+51 | async fn impl_trait_return(_: ()) -> impl serde::Serialize {}
+   |                                      ^^^^^^^^^^^^^^^^^^^^^
+
+error: #[pgqueue::job] functions cannot be generic
+  --> tests/macros/fail.rs:55:1
+   |
+55 | / where
+56 | |     u32: Copy,
+   | |______________^
+
+error: invalid cron expression "99 * * * *": failed to parse crontab expression:
+       99 * * * *
+       ^ value must be in range 0..=59; found 99
+  --> tests/macros/fail.rs:61:17
+   |
+61 | #[pgqueue::cron("99 * * * *")]
+   |                 ^^^^^^^^^^^^
+
+error: expected a cron expression string as the first argument, e.g. #[pgqueue::cron("0 * * * *")]
+  --> tests/macros/fail.rs:64:17
+   |
+64 | #[pgqueue::cron(30)]
+   |                 ^^
+
+error: expected an unsuffixed integer literal
+  --> tests/macros/fail.rs:91:29
+   |
+91 | #[pgqueue::job(timeout_ms = 30u64)]
+   |                             ^^^^^
+
+error: `backoff` is not supported; use `max_backoff_ms = ...`
+  --> tests/macros/fail.rs:94:16
+   |
+94 | #[pgqueue::job(backoff)]
+   |                ^^^^^^^
+
+error: priority must fit in a signed 16-bit integer
+  --> tests/macros/fail.rs:99:27
+   |
+99 | #[pgqueue::job(priority = -32769, max_attempts = 2)]
+   |                           ^^^^^^
+
+error: #[pgqueue::job] functions cannot be variadic
+   --> tests/macros/fail.rs:103:30
+    |
+103 | async fn variadic_job(_: (), _: ...) {}
+    |                              ^^^^^^
+
+error: expected a non-negative integer literal
+   --> tests/macros/fail.rs:116:31
+    |
+116 | #[pgqueue::job(max_attempts = -1)]
+    |                               ^^
+
+error: expected a non-negative integer literal
+   --> tests/macros/fail.rs:119:31
+    |
+119 | #[pgqueue::job(max_attempts = -1, timeout_ms = 5)]
+    |                               ^^
+
+error: expected a non-negative integer literal
+   --> tests/macros/fail.rs:122:41
+    |
+122 | #[pgqueue::cron("* * * * *", revision = -1)]
+    |                                         ^^
+
+error: #[pgqueue::job] functions cannot gate a parameter with `#[cfg]`; the attribute is expanded before `cfg` is evaluated, so the parameter is always part of the signature it reads
+   --> tests/macros/fail.rs:142:37
+    |
+142 | async fn cfg_gated_parameter(_: (), #[cfg(any())] _metrics: u32) {}
+    |                                     ^^^^^^^^^^^^^
+
+error: #[pgqueue::job] functions cannot gate a parameter with `#[cfg]`; the attribute is expanded before `cfg` is evaluated, so the parameter is always part of the signature it reads
+   --> tests/macros/fail.rs:147:42
+    |
+147 | async fn cfg_attr_gated_parameter(_: (), #[cfg_attr(any(), cfg(any()))] _metrics: u32) {}
+    |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: #[pgqueue::job] functions cannot gate a parameter with `#[cfg]`; the attribute is expanded before `cfg` is evaluated, so the parameter is always part of the signature it reads
+   --> tests/macros/fail.rs:152:47
+    |
+152 | async fn cfg_attr_bool_gated_parameter(_: (), #[cfg_attr(true, cfg(false))] _metrics: u32) {}
+    |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: invalid cron expression "0 0 30 2 *": schedule never fires
+   --> tests/macros/fail.rs:158:17
+    |
+158 | #[pgqueue::cron("0 0 30 2 *")]
+    |                 ^^^^^^^^^^^^
+
+error: invalid cron expression "0 0 31 4 *": schedule never fires
+   --> tests/macros/fail.rs:161:17
+    |
+161 | #[pgqueue::cron("0 0 31 4 *")]
+    |                 ^^^^^^^^^^^^
+
+error: `__config` is reserved by the #[pgqueue::job] expansion; rename the function and keep the stored job name with `name = "__config"` if it matters
+   --> tests/macros/fail.rs:169:10
+    |
+169 | async fn __config(_: ()) {}
+    |          ^^^^^^^^
+
+error: `__ctx` is reserved by the #[pgqueue::job] expansion; rename the function and keep the stored job name with `name = "__ctx"` if it matters
+   --> tests/macros/fail.rs:172:10
+    |
+172 | async fn __ctx(_: ()) {}
+    |          ^^^^^
+
+error: `__arg0` is reserved by the #[pgqueue::job] expansion; rename the function and keep the stored job name with `name = "__arg0"` if it matters
+   --> tests/macros/fail.rs:175:10
+    |
+175 | async fn __arg0(_: ()) {}
+    |          ^^^^^^
+
+error: #[pgqueue::job] functions cannot take a borrowed payload; it is deserialized from storage, so it must be owned
+   --> tests/macros/fail.rs:182:30
+    |
+182 | async fn borrowed_payload(_: &str) {}
+    |                              ^^^^
+
+error: #[pgqueue::job] functions cannot return a borrowed type; the output is serialized into the job row and read back, so it must be owned
+   --> tests/macros/fail.rs:185:36
+    |
+185 | async fn borrowed_output(_: ()) -> &'static str {
+    |                                    ^^^^^^^^^^^^
+
+error: #[pgqueue::job] functions cannot take a borrowed payload; it is deserialized from storage, so it must be owned
+   --> tests/macros/fail.rs:197:13
+    |
+197 | job_taking!(&str);
+    |             ^^^^
+
+error: #[pgqueue::job] functions cannot return a borrowed type; the output is serialized into the job row and read back, so it must be owned
+   --> tests/macros/fail.rs:200:51
+    |
+200 | async fn parenthesized_borrowed_output(_: ()) -> (&'static str) {
+    |                                                   ^^^^^^^^^^^^
+
+error: #[pgqueue::job] functions cannot take a borrowed payload; it is deserialized from storage, so it must be owned
+   --> tests/macros/fail.rs:209:44
+    |
+209 | async fn nested_borrowed_payload(_: Option<&str>) {}
+    |                                            ^^^^
+
+error: #[pgqueue::job] functions cannot take a borrowed payload; it is deserialized from storage, so it must be owned
+   --> tests/macros/fail.rs:212:37
+    |
+212 | async fn tuple_borrowed_payload(_: (&str, u32)) {}
+    |                                     ^^^^
+
+error: #[pgqueue::job] functions cannot take a borrowed payload; it is deserialized from storage, so it must be owned
+   --> tests/macros/fail.rs:215:49
+    |
+215 | async fn elided_cow_payload(_: std::borrow::Cow<'_, str>) {}
+    |                                                 ^^
+
+error: #[pgqueue::cron] functions cannot return a borrowed type; the output is serialized into the job row and read back, so it must be owned
+   --> tests/macros/fail.rs:218:60
+    |
+218 | async fn nested_borrowed_output() -> anyhow::Result<Option<&str>> {
+    |                                                            ^^^^
+
+error: malformed `expect` attribute input
+   --> tests/macros/fail.rs:108:1
+    |
+108 | #[expect]
+    | ^^^^^^^^^
+    |
+    = note: for more information, visit <https://doc.rust-lang.org/reference/attributes/diagnostics.html#lint-check-attributes>
+help: the following are the possible correct uses
+    |
+108 | #[expect(lint1)]
+    |         +++++++
+108 | #[expect(lint1, lint2, ...)]
+    |         +++++++++++++++++++
+108 | #[expect(lint1, lint2, lint3, reason = "...")]
+    |         +++++++++++++++++++++++++++++++++++++
+
+error[E0277]: the trait bound `u32: pgqueue::__private::IntoJobResult` is not satisfied
+  --> tests/macros/fail.rs:84:41
+   |
+84 | async fn returns_a_bare_value(_: ()) -> u32 {
+   |                                         ^^^ the trait `pgqueue::__private::IntoJobResult` is not implemented for `u32`
+   |
+help: the following other types implement trait `pgqueue::__private::IntoJobResult`
+  --> src/job.rs
+   |
+   | / impl<T, E> IntoJobResult for Result<T, E>
+   | | where
+   | |     T: Serialize + DeserializeOwned + Send + 'static,
+   | |     E: std::fmt::Display + 'static,
+   | |___________________________________^ `Result<T, E>`
+...
+   |   impl IntoJobResult for () {
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^ `()`
+
+error[E0277]: the trait bound `NotSerde: serde::Deserialize<'de>` is not satisfied
+   --> tests/macros/fail.rs:132:37
+    |
+132 | async fn payload_without_derives(_: NotSerde) {}
+    |                                     ^^^^^^^^ unsatisfied trait bound
+    |
+help: the trait `for<'de> Deserialize<'de>` is not implemented for `NotSerde`
+   --> tests/macros/fail.rs:129:1
+    |
+129 | struct NotSerde;
+    | ^^^^^^^^^^^^^^^
+    = note: for local types consider adding `#[derive(serde::Deserialize)]` to your `NotSerde` type
+    = note: for types from other crates check whether the crate offers a `serde` feature flag
+    = help: the following other types implement trait `Deserialize<'de>`:
+              &'a Path
+              &'a [u8]
+              &'a serde_json::raw::RawValue
+              &'a str
+              ()
+              (T,)
+              (T0, T1)
+              (T0, T1, T2)
+            and $N others
+    = note: required for `<payload_without_derives as JobType>::Args` to implement `DeserializeOwned`
+note: required by a bound in `pgqueue::JobType::Args`
+   --> src/job.rs
+    |
+    |     type Args: Serialize + DeserializeOwned + Send + 'static;
+    |                            ^^^^^^^^^^^^^^^^ required by this bound in `JobType::Args`
+
+error[E0277]: the trait bound `NotSerde: serde::Serialize` is not satisfied
+   --> tests/macros/fail.rs:132:37
+    |
+132 | async fn payload_without_derives(_: NotSerde) {}
+    |                                     ^^^^^^^^ unsatisfied trait bound
+    |
+help: the trait `Serialize` is not implemented for `NotSerde`
+   --> tests/macros/fail.rs:129:1
+    |
+129 | struct NotSerde;
+    | ^^^^^^^^^^^^^^^
+    = note: for local types consider adding `#[derive(serde::Serialize)]` to your `NotSerde` type
+    = note: for types from other crates check whether the crate offers a `serde` feature flag
+    = help: the following other types implement trait `Serialize`:
+              &'a T
+              &'a mut T
+              ()
+              (T,)
+              (T0, T1)
+              (T0, T1, T2)
+              (T0, T1, T2, T3)
+              (T0, T1, T2, T3, T4)
+            and $N others
+note: required by a bound in `pgqueue::JobType::Args`
+   --> src/job.rs
+    |
+    |     type Args: Serialize + DeserializeOwned + Send + 'static;
+    |                ^^^^^^^^^ required by this bound in `JobType::Args`
+
+error[E0277]: the trait bound `NotAnExtractor: FromJobContext` is not satisfied
+  --> tests/macros/fail.rs:71:38
+   |
+71 | async fn bad_extractor(_: (), value: NotAnExtractor) {
+   |                                      ^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `FromJobContext` is not implemented for `NotAnExtractor`
+  --> tests/macros/fail.rs:68:1
+   |
+68 | struct NotAnExtractor;
+   | ^^^^^^^^^^^^^^^^^^^^^
+help: the following other types implement trait `FromJobContext`
+  --> src/job.rs
+   |
+   | impl FromJobContext for JobContext {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `JobContext`
+...
+   | impl<T: Clone + Send + Sync + 'static> FromJobContext for JobState<T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `JobState<T>`
+
+error[E0277]: the trait bound `Payload: FromJobContext` is not satisfied
+  --> tests/macros/fail.rs:79:30
+   |
+79 | async fn cron_payload(value: Payload) {
+   |                              ^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `FromJobContext` is not implemented for `Payload`
+  --> tests/macros/fail.rs:76:1
+   |
+76 | struct Payload;
+   | ^^^^^^^^^^^^^^
+help: the following other types implement trait `FromJobContext`
+  --> src/job.rs
+   |
+   | impl FromJobContext for JobContext {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `JobContext`
+...
+   | impl<T: Clone + Send + Sync + 'static> FromJobContext for JobState<T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `JobState<T>`
+
+error[E0277]: the trait bound `u32: pgqueue::__private::IntoJobResult` is not satisfied
+  --> tests/macros/fail.rs:84:41
+   |
+83 | #[pgqueue::job]
+   | --------------- required by a bound introduced by this call
+84 | async fn returns_a_bare_value(_: ()) -> u32 {
+   |                                         ^^^ the trait `pgqueue::__private::IntoJobResult` is not implemented for `u32`
+   |
+help: the following other types implement trait `pgqueue::__private::IntoJobResult`
+  --> src/job.rs
+   |
+   | / impl<T, E> IntoJobResult for Result<T, E>
+   | | where
+   | |     T: Serialize + DeserializeOwned + Send + 'static,
+   | |     E: std::fmt::Display + 'static,
+   | |___________________________________^ `Result<T, E>`
+...
+   |   impl IntoJobResult for () {
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^ `()`
+note: required by a bound in `pgqueue::__private::encode_result`
+  --> src/lib.rs
+   |
+   |     pub fn encode_result<R>(result: R) -> Result<Value, JobError>
+   |            ------------- required by a bound in this function
+   |     where
+   |         R: IntoJobResult,
+   |            ^^^^^^^^^^^^^ required by this bound in `encode_result`
+
+error[E0080]: evaluation panicked: timeout_ms exceeds pgqueue's maximum supported duration
+  --> tests/macros/fail.rs:88:29
+   |
+88 | #[pgqueue::job(timeout_ms = 3_153_600_000_001)]
+   |                             ^^^^^^^^^^^^^^^^^ evaluation of `_` failed here
+
+error[E0277]: the trait bound `NotSerde: serde::de::DeserializeOwned` is not satisfied
+   --> tests/macros/fail.rs:132:37
+    |
+132 | async fn payload_without_derives(_: NotSerde) {}
+    |                                     ^^^^^^^^ unsatisfied trait bound
+    |
+help: the trait `for<'de> Deserialize<'de>` is not implemented for `NotSerde`
+   --> tests/macros/fail.rs:129:1
+    |
+129 | struct NotSerde;
+    | ^^^^^^^^^^^^^^^
+    = help: the following other types implement trait `Deserialize<'de>`:
+              &'a Path
+              &'a [u8]
+              &'a serde_json::raw::RawValue
+              &'a str
+              ()
+              (T,)
+              (T0, T1)
+              (T0, T1, T2)
+            and $N others
+    = note: required for `NotSerde` to implement `DeserializeOwned`
+note: required by a bound in `pgqueue::__private::decode_payload`
+   --> src/lib.rs
+    |
+    |     pub fn decode_payload<T: DeserializeOwned>(payload: &Value) -> Result<T, JobError> {
+    |                              ^^^^^^^^^^^^^^^^ required by this bound in `decode_payload`
+
+error: future cannot be sent between threads safely
+   --> tests/macros/fail.rs:230:39
+    |
+230 |   async fn not_send_across_await(_: ()) {
+    |  _______________________________________^
+231 | |     let local = ::std::rc::Rc::new(1u32);
+232 | |     tick().await;
+233 | |     drop(local);
+234 | | }
+    | |_^ future created by async block is not `Send`
+    |
+    = help: within `{async block@$DIR/tests/macros/fail.rs:230:39: 234:2}`, the trait `Send` is not implemented for `Rc<u32>`
+note: future is not `Send` as this value is used across an await
+   --> tests/macros/fail.rs:232:12
+    |
+231 |     let local = ::std::rc::Rc::new(1u32);
+    |         ----- has type `Rc<u32>` which is not `Send`
+232 |     tick().await;
+    |            ^^^^^ await occurs here, with `local` maybe used later
+    = note: required for the cast from `Pin<Box<{async block@$DIR/tests/macros/fail.rs:230:39: 234:2}>>` to `Pin<Box<dyn Future<Output = Result<pgqueue::__private::Value, JobError>> + Send>>`

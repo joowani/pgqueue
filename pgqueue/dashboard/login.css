@@ -1,0 +1,64 @@
+/* Styles for login.html alone (the SPA loads app.css instead). A separate file rather than an inline
+   <style> block so the Content-Security-Policy can refuse inline styles everywhere: with the block,
+   `style-src` needed 'unsafe-inline', which would also have licensed style injection anywhere an
+   HTML-injection bug ever appeared. */
+
+/* app.css puts `font-size: 90%` on <html>, overriding Pico's own 100%-to-125% viewport scaling, so
+   this page has to do the same or the two surfaces disagree on what a rem is: the sign-in card was
+   rendering 39% larger than the change-password dialog it sits next to in the product. With one
+   scale shared, the sizes below can be the same numbers `.account-dialog` uses in app.css. */
+html { height: 100%; font-size: 90%; letter-spacing: 0; }
+body { min-height: 100%; letter-spacing: 0; }
+body { display: grid; margin: 0; place-items: center; background: var(--pico-background-color); }
+main { width: min(28rem, calc(100% - 2rem)); padding: 2rem 0; } /* 28rem: `.account-dialog article` */
+article {
+  margin: 0;
+  padding: 1.5rem;
+  border: 1px solid var(--pico-muted-border-color);
+  border-radius: 0.55rem;
+  /* Two layers rather than one: the tight first layer reads as the card's edge and the wide second
+     one as its lift, which a single blur cannot do at both distances. */
+  box-shadow: 0 1px 2px rgb(15 23 42 / 5%), 0 10px 24px rgb(15 23 42 / 8%);
+}
+/* The brand is a wordmark rather than an accent, so it takes the steel slate the SPA gives its own
+   `--pgj-brand` breadcrumb. This page does not load app.css, so the pair is repeated here, and both
+   halves clear WCAG AA on the card they land on: #475569 is 7.57:1 on the light card, #cbd5e1 is
+   11.48:1 on the dark one. */
+h1 {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin-bottom: 1.25rem;
+  color: #475569;
+  font-size: 1.15rem;
+  letter-spacing: 0;
+}
+.login-logo { flex: 0 0 auto; width: 1.5rem; height: 1.5rem; vertical-align: middle; }
+label { font-size: 0.8rem; }        /* `.account-dialog label` */
+/* `.account-dialog input`. The `[type]` is load-bearing, not decoration: Pico spaces fields with
+   `input:not([type=checkbox],[type=radio])`, whose `:not()` argument lifts it to the same
+   specificity as an attribute selector, so a bare `input` here would lose. */
+input[type] { margin-bottom: 0.8rem; }
+/* `.account-dialog footer button` in app.css, but full width, since this is the page's one primary
+   action. The selector has to carry `[type="submit"]`: Pico sizes buttons through a selector list
+   that includes `[type=submit]`, which outranks a bare `button` and would silently win. app.css
+   dodges the same collision by scoping its copy with a class. */
+button[type="submit"] {
+  width: 100%;
+  margin: 0.2rem 0 0;
+  padding: 0.4rem 0.8rem;
+  font-size: 0.78rem;
+  line-height: 1.25;
+}
+/* The only feedback a failed sign-in gets ("Invalid username or password.", "Too many attempts."),
+   so it has to be readable in both schemes. One value cannot be, which is why app.css splits
+   `--pgj-status-critical` per scheme; these are those two values, and this page carries its own copy
+   because it does not load app.css. */
+.error { margin: 0 0 0.5rem; color: #c62828; font-size: 0.78rem; } /* 5.62:1 on #fff */
+@media (prefers-color-scheme: dark) {
+  h1 { color: #cbd5e1; }
+  .error { color: #f28b82; } /* 7.14:1 on #181c25 */
+}
+/* Collapsed rather than merely invisible, so the usual no-error case does not hold open a gap
+   between the heading and the first field. */
+.error:empty { display: none; }

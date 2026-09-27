@@ -1,0 +1,80 @@
+[package]
+name = "pgqueue"
+description = "Background and cron job processing backed by PostgreSQL 18+"
+autotests = false
+keywords = ["job", "queue", "cron", "postgres", "worker"]
+categories = ["asynchronous", "database"]
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+exclude = ["tests/**"]
+
+[lib]
+name = "pgqueue"
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+features = ["dashboard"]
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[features]
+default = []
+dashboard = [
+    "dep:axum",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:include_dir",
+    "dep:tower",
+    "tokio/net",
+]
+# Internal: exposes the raw queue protocol to this crate's own integration
+# tests. Never enable it from application code; it bypasses the Consumer and
+# Attempt guards and carries no stability guarantee. The leading underscore
+# keeps it off the feature list docs.rs renders.
+_test = ["dashboard"]
+
+[dependencies]
+pgqueue-macros.workspace = true
+
+anyhow.workspace = true
+axum = { workspace = true, optional = true }
+cronexpr.workspace = true
+include_dir = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+jiff.workspace = true
+jiff-sqlx.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower = { workspace = true, optional = true }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# Self-reference so tests (a separate crate) get the internal test-support API
+# without it leaking into normal builds.
+pgqueue = { path = ".", features = ["_test"] }
+
+# Exercise downstream feature unification: JSON numbers can then exceed PostgreSQL's numeric range.
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "test-util"] }
+tracing-subscriber.workspace = true
+trybuild.workspace = true
+
+[[example]]
+name = "dashboard"
+required-features = ["dashboard"]

@@ -1,0 +1,75 @@
+[workspace]
+resolver = "3"
+members = ["pgqueue", "pgqueue-macros"]
+
+# Keep normal development builds fast while preserving line numbers in panic backtraces.
+# Dependencies skip debug information unless the `debugging` profile is used.
+# https://doc.rust-lang.org/cargo/guide/build-performance.html#reduce-amount-of-generated-debug-information
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+# Include debug information for dependencies when using a debugger.
+[profile.debugging.package."*"]
+debug = true
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+repository = "https://github.com/joowani/pgqueue"
+authors = ["Joohwan Oh <joohwan.oh@outlook.com>"]
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+cronexpr = "1.6.0"
+include_dir = "0.7.4"
+hyper = { version = "1.10.1", features = ["http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+jiff = { version = "0.2.35", features = ["serde"] }
+jiff-sqlx = { version = "0.2.0", features = ["postgres"] }
+pgqueue-macros = { path = "pgqueue-macros", version = "=0.1.0" }
+proc-macro-crate = "3.5.0"
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+rand = "0.10.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls-ring-webpki",
+    "macros",
+    "migrate",
+    "sqlx-toml",
+    "derive",
+    "uuid",
+    "json",
+] }
+syn = { version = "3.0.3", features = ["full", "visit"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = [
+    "macros",
+    "rt",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+tower = { version = "0.5.3", features = ["util"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+trybuild = "1.0.120"
+uuid = { version = "1.24.0", features = ["v7", "serde"] }

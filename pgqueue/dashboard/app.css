@@ -1,0 +1,252 @@
+/* Status palette. Markers and labels pair with color, so color never carries
+   state alone -- but the two entries below that are also used as *text*
+   (`--pgj-status-good` in `.account-message`, `--pgj-status-critical` in
+   `.error-banner`, `.form-error`, `.action-message.error` and `.refresh-error`)
+   are selected per scheme, because no single value clears WCAG AA 4.5:1 against
+   both a white and a near-black surface. The values that stay fixed are only
+   ever markers. Ratios below are against the worst surface each is drawn on:
+   Pico's card background and `--pgj-table-header`. */
+:root {
+  --pgj-status-good: #067806;      /* 5.68:1 on #fff */
+  --pgj-status-serious: #ec835a;
+  --pgj-status-critical: #c62828;  /* 5.62:1 on #fff, 5.13:1 on #f1f5f9 */
+  --pgj-status-running: #2a78d6;
+  --pgj-status-neutral: #8a8984;
+  --pgj-table-border: #c1c8d3;
+  --pgj-table-row-border: #cbd5e1;
+  --pgj-table-header: #f1f5f9;
+  --pgj-table-footer: #f8fafc;
+  --pgj-table-header-text: #475569;
+  --pgj-table-hover: #eff6ff;
+  --pgj-filter-background: #ffffff;
+  --pgj-filter-text: #373c44;
+  --pgj-selected-background: #e0f2fe;
+  --pgj-selected-border: #0284c7;
+  --pgj-selected-text: #111827;
+  /* Wordmark slate, dark enough to read as steel without competing with the accent: 7.57:1 on
+     the light header, 11.48:1 on the dark one. login.css repeats the pair, since it does not
+     load this file. */
+  --pgj-brand: #475569;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --pgj-status-good: #0dab0d;      /* 5.56:1 on #181c25, 4.88:1 on #24272e */
+    --pgj-status-critical: #f28b82;  /* 7.14:1 on #181c25, 6.26:1 on #24272e */
+    --pgj-status-running: #3987e5;
+    --pgj-table-border: #4b4f58;
+    --pgj-table-row-border: #3f444d;
+    --pgj-table-header: #24272e;
+    --pgj-table-footer: #2b2f37;
+    --pgj-table-header-text: #cbd5e1;
+    --pgj-table-hover: #202d3d;
+    --pgj-filter-background: #161a22;
+    --pgj-filter-text: #c2c7d0;
+    /* Without these the pressed status filter, the Job/Cron tabs and the
+       highlighted name suggestion kept the light pill on a near-black page —
+       and the status dot inside the chip, which does re-theme, fell from 7.30:1
+       on the unpressed chip to 2.08:1 the moment the filter was pressed. */
+    --pgj-selected-background: #14324a;
+    --pgj-selected-border: #38bdf8;
+    --pgj-selected-text: #e0f2fe;
+    --pgj-brand: #cbd5e1;
+  }
+}
+html { height: 100%; overflow: hidden; font-size: 90%; }
+body { height: 100%; overflow: hidden; letter-spacing: 0; }
+body > main { width: 100%; padding: 0; }
+#app { display: grid; height: 100vh; height: 100dvh; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
+/* `min-width: 0`: a grid item's minimum is otherwise its content's, and `#app`'s one column grew to fit a header that
+   cannot wrap -- a long queue name, a refresh error -- so the whole app came out wider than the screen, with the
+   account menu and the right of every table past its edge. */
+.app-header { z-index: 50; display: flex; width: 100%; min-width: 0; height: 3.5rem; align-items: center; padding-inline: 2rem; overflow: visible; background: var(--pico-background-color); box-shadow: 0 2px 7px rgb(15 23 42 / 16%); }
+.breadcrumbs { display: block; min-width: 0; height: 100%; flex: 1 1 auto; margin: 0; overflow: hidden; }
+nav.breadcrumbs > ol:first-of-type, nav.breadcrumbs > ol:last-of-type { margin-inline: 0; }
+.breadcrumbs ol { display: flex; width: 100%; height: 100%; align-items: center; gap: 0; margin: 0; padding: 0; overflow: hidden; list-style: none; white-space: nowrap; }
+.breadcrumbs li { display: inline-flex; min-width: 0; flex: 0 0 auto; align-items: center; padding: 0; color: var(--pico-color); font-size: 0.78rem; line-height: 1.25; }
+.breadcrumbs li:last-child { flex: 1 1 auto; overflow: hidden; }
+.breadcrumbs li + li::before { flex: 0 0 auto; margin: 0 0.2rem; color: var(--pico-muted-color); content: "\203a"; font-size: 1.15rem; line-height: 1; }
+.breadcrumbs li > a, .breadcrumbs li > span { margin: 0; }
+.breadcrumbs a, .breadcrumbs [aria-current="page"] { display: block; padding: 0.4rem 0.55rem; border-radius: 0.25rem; color: var(--pico-color); text-decoration: none; }
+.breadcrumbs li:last-child > * { min-width: 0; flex: 0 1 auto; }
+.breadcrumbs a:hover { background: var(--pgj-table-header); }
+.breadcrumbs [aria-current="page"] { color: var(--pico-muted-color); }
+/* The first crumb is the product wordmark rather than a step in the trail, so it keeps the
+   brand slate whether it is a link or the current page. */
+.breadcrumbs li:first-child > a,
+.breadcrumbs li:first-child > [aria-current="page"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding-left: 0;
+  color: var(--pgj-brand);
+  font-weight: 600;
+}
+.breadcrumb-logo { flex: 0 0 auto; width: 1.2rem; height: 1.2rem; vertical-align: middle; }
+.nav-context { display: flex; min-width: 0; flex: 0 0 auto; align-items: center; gap: 0.45rem; margin-left: 0.75rem; padding-left: 1rem; border-left: 1px solid var(--pgj-table-border); color: var(--pico-muted-color); font-size: 0.72rem; white-space: nowrap; }
+.account-menu { position: relative; height: 2rem; margin: 0; }
+.account-menu > summary { display: inline-flex; height: 2rem; align-items: center; margin: 0; padding: 0.35rem 0.45rem; border-radius: 0.25rem; color: var(--pico-color); cursor: pointer; }
+.account-menu[open] > summary { margin-bottom: 0; }
+.account-menu > summary::after { flex: 0 0 1rem; float: none; margin-inline-start: 0.35rem; }
+.account-menu > summary:hover, .account-menu > summary:focus-visible { background: var(--pgj-table-header); }
+.account-menu > ul { z-index: 110; position: absolute; top: calc(100% + 0.3rem); right: 0; width: 11rem; margin: 0; padding: 0.25rem; border: 1px solid var(--pgj-table-border); border-radius: 0.35rem; background: var(--pgj-filter-background); box-shadow: var(--pico-box-shadow); color: var(--pgj-filter-text); list-style: none; }
+.account-menu:not([open]) > ul { display: none; }
+.account-menu > ul li { margin: 0; padding: 0; }
+.account-menu > ul button { width: 100%; margin: 0; padding: 0.45rem 0.55rem; border: 0; border-radius: 0.2rem; background: transparent; box-shadow: none; color: var(--pgj-filter-text); font-size: 0.78rem; text-align: left; }
+.account-menu > ul button:hover, .account-menu > ul button:focus-visible { background: var(--pgj-table-header); }
+.account-message { color: var(--pgj-status-good); font-size: 0.72rem; }
+.account-message.error { color: var(--pgj-status-critical); }
+/* Cut short, with the whole message in its `title`: beside the breadcrumbs `.nav-context` never shrinks, so a long
+   error took their room, and on its own row (see the 760px block) it is capped at the header's width for this to give
+   way rather than push the account menu off the screen. */
+.refresh-error { max-width: 24rem; overflow: hidden; color: var(--pgj-status-critical); text-overflow: ellipsis; }
+.account-dialog article { width: min(28rem, calc(100% - 2rem)); }
+.account-dialog header { margin-bottom: 1rem; }
+.account-dialog h2 { margin: 0; font-size: 1rem; }
+.account-dialog label { font-size: 0.8rem; }
+.account-dialog input { margin-bottom: 0.8rem; }
+.account-dialog .form-error { min-height: 1.25rem; margin: 0 0 0.5rem; color: var(--pgj-status-critical); font-size: 0.78rem; }
+.account-dialog footer { display: flex; justify-content: flex-end; gap: 0.5rem; }
+.account-dialog footer button { width: auto; margin: 0; }
+.page-content { width: 100%; min-width: 0; min-height: 0; padding: 1.25rem 2rem 2rem; overflow: hidden; }
+.home-page { display: grid; grid-template-rows: minmax(0, 1fr); }
+.queue-page { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 1.25rem; }
+/* One row per child the detail views render: heading, action message, table.
+   With only two declared, an unhidden `.action-message` took the flexible row
+   the table needs, collapsed to a single line, and left the table to an
+   implicit row starting at the same y -- the message drew on top of the first
+   table rows. `.table-scroll` is placed explicitly so it keeps the flexible
+   row (and its scroll box keeps filling the page) whether the message is on
+   screen or `display: none`, and on the worker detail, which has no message
+   element at all. */
+.detail-page { display: grid; grid-template-rows: auto auto minmax(0, 1fr); }
+.detail-page > .table-frame { grid-row: 3; }
+.table-section, .jobs-section { min-width: 0; min-height: 0; margin: 0; }
+.table-section { display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.queues-section { grid-template-rows: auto auto minmax(0, 1fr); }
+.workers-section { grid-template-rows: auto auto; }
+.workers-section .table-frame { grid-template-rows: auto auto; }
+.workers-section .table-scroll { max-height: 16.5rem; }
+.workers-section .data-table th, .workers-section .data-table td { white-space: nowrap; }
+.jobs-section { display: grid; grid-template-rows: auto auto minmax(0, 1fr); }
+
+/* Status badge: colored dot + ink label. */
+.status { white-space: nowrap; }
+.status .dot { display: inline-block; width: 0.55em; height: 0.55em; border-radius: 50%; margin-right: 0.4em; background: var(--pgj-status-neutral); }
+.status.running .dot { background: var(--pgj-status-running); }
+.status.aborting .dot { background: var(--pgj-status-serious); }
+.status.complete .dot { background: var(--pgj-status-good); }
+.status.failed .dot { background: var(--pgj-status-critical); }
+.status.aborted .dot { background: var(--pgj-status-serious); }
+.signal { display: inline-flex; min-height: 1.65rem; align-items: center; padding: 0.15rem 0.45rem; border: 1px solid var(--pgj-table-border); border-radius: 0.3rem; background: var(--pgj-filter-background); color: var(--pgj-filter-text); font-size: 0.75rem; line-height: 1; white-space: nowrap; }
+.signal.running { border-color: color-mix(in srgb, var(--pgj-status-running) 35%, var(--pgj-table-border)); background: color-mix(in srgb, var(--pgj-status-running) 8%, var(--pico-background-color)); }
+.signal.complete { border-color: color-mix(in srgb, var(--pgj-status-good) 35%, var(--pgj-table-border)); background: color-mix(in srgb, var(--pgj-status-good) 8%, var(--pico-background-color)); }
+.signal.failed { border-color: color-mix(in srgb, var(--pgj-status-critical) 35%, var(--pgj-table-border)); background: color-mix(in srgb, var(--pgj-status-critical) 8%, var(--pico-background-color)); }
+.signal.aborted { border-color: color-mix(in srgb, var(--pgj-status-serious) 35%, var(--pgj-table-border)); background: color-mix(in srgb, var(--pgj-status-serious) 8%, var(--pico-background-color)); }
+.queue-state .signal { width: 5rem; justify-content: center; }
+
+h2 { margin: 1.4rem 0 0.55rem; font-size: 0.95rem; }
+.page-content > h2:first-child { margin-top: 0; }
+.table-section h2, .jobs-section h2 { margin-top: 0; }
+.table-scroll { width: 100%; min-width: 0; min-height: 0; margin: 0; overflow: auto; overscroll-behavior: contain; background: var(--pico-background-color); scrollbar-gutter: auto; }
+/* `.table-frame` owns the box's border, and draws it in `::after` on top of the rows rather than as its own
+   `border`. A plain border sits *under* the content, so the rounded clip that `overflow: hidden` puts on the sticky
+   `thead` background is antialiased right along the border's inner edge, and it washes out the two top corners:
+   measured at 0.78px of ink against 1.00px on the straight runs, while the bottom corners kept 0.86px. Painting the
+   ring last puts all four corners at the same weight. */
+.table-frame { position: relative; display: grid; min-width: 0; min-height: 0; grid-template-rows: minmax(0, 1fr) auto; overflow: hidden; border-radius: 0.35rem; background: var(--pico-background-color); }
+.table-frame::after { z-index: 5; position: absolute; inset: 0; border: 1px solid var(--pgj-table-border); border-radius: 0.35rem; content: ""; pointer-events: none; }
+.data-table { width: 100%; margin: 0; border: 0; border-collapse: separate; border-spacing: 0; font-size: 0.875rem; }
+.data-table th, .data-table td { height: 2.75rem; padding: 0.6rem 0.75rem; border: 0; border-bottom: 1px solid var(--pgj-table-row-border); text-align: left; vertical-align: middle; }
+.data-table thead th { position: sticky; top: 0; z-index: 1; height: 2.75rem; background: var(--pgj-table-header); color: var(--pgj-table-header-text); font-size: 0.72rem; font-weight: 650; text-transform: uppercase; }
+.data-table tbody tr.clickable-row { cursor: pointer; }
+.data-table tbody tr.clickable-row:hover > td { background: var(--pgj-table-hover); }
+/* -3px, not the -2px an edge-to-edge row would want: `.table-frame` has no `border` of its own, so a row now reaches
+   the frame edge and the `::after` ring paints over the outer 1px of anything drawn there. At -2px the outline's left
+   and right segments came out 1px wide against 2px top and bottom. */
+.data-table tbody tr.clickable-row:focus-visible { outline: 2px solid var(--pico-primary); outline-offset: -3px; }
+.data-table .empty-row td { height: 2.75rem; color: var(--pico-muted-color); text-align: center; }
+.data-table tbody th { width: 10rem; background: var(--pgj-table-header); }
+.detail-page .data-table tbody th { color: var(--pgj-table-header-text); font-size: 0.72rem; font-weight: 650; text-transform: uppercase; }
+.data-table td.num, .data-table th.num { text-align: left; font-variant-numeric: tabular-nums; }
+.data-table a { text-decoration: none; }
+.job-id { min-width: 36ch; white-space: nowrap; }
+.job-name { max-width: 24rem; }
+.job-name > span { display: block; max-width: 24rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.timestamp { display: inline-block; min-width: 10.5rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.job-toolbar { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
+.filter-group, .search-filter { margin: 0; }
+.table-search { width: 100%; margin-bottom: 0.75rem; }
+.segmented { display: inline-flex; height: 2.25rem; margin: 0; }
+.segmented button { display: inline-flex; height: 2.25rem; min-height: 2.25rem; align-items: center; justify-content: center; gap: 0.35rem; margin: 0 0 0 -1px; padding: 0 0.6rem; border: 1px solid var(--pgj-table-border); border-radius: 0; background: var(--pgj-filter-background); color: var(--pgj-filter-text); font-size: 0.76rem; line-height: 1; opacity: 1; }
+.segmented button:first-child { margin-left: 0; border-radius: 0.3rem 0 0 0.3rem; }
+.segmented button:last-child { border-radius: 0 0.3rem 0.3rem 0; }
+.segmented button[aria-pressed="false"] { background: var(--pgj-filter-background); color: var(--pgj-filter-text); }
+.segmented button[aria-pressed="true"], .segmented button[aria-selected="true"] { z-index: 2; border-width: 1px; border-color: var(--pgj-selected-border); background: var(--pgj-selected-background); color: var(--pgj-selected-text); }
+.kind-tabs { flex: 0 0 auto; }
+.search-filter { min-width: 12rem; flex: 1 1 18rem; }
+.search-field { position: relative; display: flex; width: 100%; border-radius: 0.35rem; }
+.search-field input { width: 100%; height: 2.25rem; min-height: 2.25rem; flex: 1 1 auto; margin: 0; padding-block: 0; padding-inline: 0.3rem !important; border: 1px solid var(--pgj-table-border) !important; border-radius: 0.35rem !important; appearance: none; background-image: none !important; font-size: 0.8rem; text-indent: 0; }
+.search-field input:focus { border-color: var(--pico-primary-border) !important; box-shadow: 0 0 0 var(--pico-outline-width) var(--pico-primary-focus); }
+.search-field input::-webkit-search-decoration { appearance: none; }
+.job-name-search { position: relative; }
+.name-suggestions { display: block; z-index: 100; position: absolute; top: calc(100% + 0.15rem); right: 0; left: 0; max-height: 14rem; margin: 0; overflow-y: auto; padding: 0.25rem; border: 1px solid var(--pgj-table-border); border-radius: 0.35rem; background: var(--pico-background-color); box-shadow: var(--pico-box-shadow); list-style: none; }
+/* Set by app.mjs (placeSuggestionList), which measures the room above and below the search box. A `max-height` query
+   used to turn the list up on every short screen, but there the page scrolls, and with the jobs scrolled into view the
+   list opened into the page's scrolled-away top, under the header. */
+.name-suggestions.above { top: auto; bottom: calc(100% + 0.15rem); }
+.name-suggestions li { margin: 0; padding: 0; }
+.name-suggestions button { display: block; width: 100%; margin: 0; padding: 0.4rem 0.55rem; border: 0; border-radius: 0.2rem; background: transparent; box-shadow: none; color: var(--pgj-filter-text); font-size: 0.76rem; text-align: left; }
+.name-suggestions button:hover, .name-suggestions button:focus-visible, .name-suggestions button[aria-selected="true"] { background: var(--pgj-selected-background); box-shadow: none; color: var(--pgj-selected-text); }
+pre.blob { min-height: 3rem; max-height: 24rem; margin: 0; overflow: auto; padding: 0.75rem; border: 1px solid var(--pgj-table-border); border-radius: 0.35rem; background: var(--pgj-table-header); font-size: 0.76rem; }
+pre.blob .truncated { display: block; margin-top: 0.4rem; color: var(--pico-muted-color); font-style: italic; }
+td .truncated { color: var(--pico-muted-color); font-style: italic; }
+.detail-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 0.55rem; }
+.detail-heading h2 { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.detail-heading .actions { margin: 0; }
+.actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-bottom: 0.75rem; }
+.actions button, .account-dialog footer button { display: inline-flex; width: auto; min-height: 0; align-items: center; gap: 0.4rem; margin: 0; padding: 0.4rem 0.8rem; font-size: 0.78rem; line-height: 1.25; }
+.action-message { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.55rem; padding: 0.45rem 0.6rem; border: 1px solid var(--pgj-table-border); border-radius: 0.35rem; background: var(--pgj-table-header); font-size: 0.78rem; }
+.action-message[hidden] { display: none; }
+.action-message.error .action-message-text { color: var(--pgj-status-critical); }
+.action-message button { width: auto; min-height: 0; margin: 0; padding: 0.25rem 0.6rem; font-size: 0.74rem; }
+.pager { position: relative; display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 0.75rem; margin: 0; padding: 0.25rem 0.55rem; border-top: 0; background: var(--pgj-table-footer); }
+.pager::before { position: absolute; top: -1px; right: 0; left: 0; height: 1px; background: var(--pgj-table-border); content: ""; pointer-events: none; }
+.pager-controls { display: flex; gap: 0.3rem; }
+.pager button { display: inline-flex; width: auto; min-height: 1.8rem; align-items: center; justify-content: center; margin: 0; padding: 0.2rem 0.55rem; font-size: 0.76rem; }
+/* Not `--pico-muted-color`: it is tuned for Pico's own page background, and on
+   `.pager`'s `--pgj-table-footer` it measured 3.57:1 in dark — under WCAG AA for
+   the 10.8px text this is. */
+.pager-summary { color: var(--pgj-table-header-text); font-size: 0.75rem; }
+.status-chip { display: inline-flex; width: auto; min-height: 1.65rem; align-items: center; margin: 0; padding: 0.15rem 0.45rem; border: 1px solid var(--pgj-table-border); border-radius: 0.3rem; background: var(--pgj-filter-background); box-shadow: none; color: var(--pgj-filter-text); font-size: 0.75rem; font-weight: 500; line-height: 1; }
+.status-chip:hover, .status-chip:focus { border-color: var(--pico-primary); background: var(--pgj-table-hover); color: var(--pgj-filter-text); }
+/* `pre-wrap`: a stored error keeps its line breaks, and the common multi-line ones -- an `assert_eq!` panic's
+   `left:`/`right:` pair, an error chain printed one cause per line -- ran together into one line without it. */
+.error-banner { color: var(--pgj-status-critical); white-space: pre-wrap; }
+.mono { font-family: var(--pico-font-family-monospace, monospace); font-size: 0.82em; }
+@media (max-width: 760px) {
+  .app-header { height: auto; min-height: 3.5rem; align-items: stretch; flex-direction: column; padding: 0.25rem 1rem; }
+  .page-content { padding: 1rem; }
+  .home-page, .queue-page { gap: 0.85rem; }
+  .nav-context { max-width: 100%; align-self: flex-end; margin: 0; padding: 0.2rem 0; border: 0; }
+  .breadcrumbs { width: 100%; height: auto; overflow: visible; }
+  .breadcrumbs ol { min-height: 2.75rem; height: auto; flex-wrap: wrap; align-content: center; padding-block: 0.2rem; overflow: visible; }
+  .breadcrumbs li:last-child { flex: 0 0 auto; overflow: visible; }
+  .breadcrumbs li:last-child > * { flex: 0 0 auto; }
+  .job-toolbar { align-items: stretch; flex-direction: column; }
+  .segmented { display: grid; height: auto; grid-template-columns: repeat(4, 1fr); }
+  .kind-tabs { grid-template-columns: repeat(2, 1fr); }
+  .segmented button, .segmented button:first-child, .segmented button:last-child { margin: -1px 0 0 -1px; border-radius: 0; }
+  .segmented button:nth-child(4n + 1) { margin-left: 0; }
+  .search-filter { width: 100%; height: 2.25rem; min-width: 0; flex: none; }
+  .search-field { height: 2.25rem; }
+}
+/* The queue page stacks the workers table (up to 16.5rem, plus its pager) over the jobs heading, toolbar and table.
+   On a short screen -- or a narrow one, where the jobs toolbar stacks into four rows -- the jobs table got what was
+   left: its header alone, or nothing, in a shell where nothing else scrolls, so no row, and no way to a job's page,
+   could be reached. Here the page scrolls instead, with a floor under the jobs section that leaves its table a few
+   rows below the stacked toolbar. `max-content`, not `auto`: the sections carry `min-height: 0`, so an `auto` row gave
+   way and the grid squeezed the workers table rather than overflow. */
+@media (max-width: 760px), (max-height: 700px) {
+  .page-content { overflow-y: auto; }
+  .queue-page { grid-template-rows: max-content minmax(30rem, 1fr); }
+}

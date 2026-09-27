@@ -1,0 +1,97 @@
+name: publish
+
+run-name: Publish v${{ github.event.client_payload.version }}
+
+on:
+  # Send event_type=publish with client_payload.version through the repository dispatch API.
+  repository_dispatch:
+    types: [publish]
+
+concurrency:
+  group: publish-${{ github.event.client_payload.version }}
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ github.event.client_payload.version }}
+
+jobs:
+  # Reject a bad version, source ref, or tag before spending a full check run on it. The publish job validates again,
+  # because a conflicting tag can appear while the checks run.
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Validate release source
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          expected_ref="refs/heads/$DEFAULT_BRANCH"
+          if [[ "$GITHUB_REF" != "$expected_ref" ]]; then
+              echo "repository dispatch resolved to $GITHUB_REF instead of $expected_ref" >&2
+              exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Validate version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: shell/scripts/publish --check "$VERSION"
+
+  check:
+    name: Check
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/check.yml
+
+  publish-crates:
+    name: Publish Crates
+    needs: check
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Validate release source
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          expected_ref="refs/heads/$DEFAULT_BRANCH"
+          if [[ "$GITHUB_REF" != "$expected_ref" ]]; then
+              echo "repository dispatch resolved to $GITHUB_REF instead of $expected_ref" >&2
+              exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Validate version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: shell/scripts/publish --check "$VERSION"
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish crates and the GitHub release
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: shell/scripts/publish "$VERSION"

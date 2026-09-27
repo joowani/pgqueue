@@ -1,0 +1,11 @@
+error: identifiers cannot contain emoji: `send_🦀`
+ --> tests/macros/fail_emoji_name.rs:8:14
+  |
+8 | pub async fn send_🦀(_: ()) {}
+  |              ^^^^^^^
+
+error: identifiers cannot contain emoji: `tick_🦀`
+  --> tests/macros/fail_emoji_name.rs:11:14
+   |
+11 | pub async fn tick_🦀() {}
+   |              ^^^^^^^

@@ -1,0 +1,12 @@
+error: missing documentation for a struct
+  --> tests/macros/fail_forbid.rs:9:5
+   |
+ 9 |     #[pgqueue::job]
+   |     ^^^^^^^^^^^^^^^
+   |
+note: the lint level is defined here
+  --> tests/macros/fail_forbid.rs:10:14
+   |
+10 |     #[forbid(missing_docs)]
+   |              ^^^^^^^^^^^^
+   = note: this error originates in the attribute macro `pgqueue::job` (in Nightly builds, run with -Z macro-backtrace for more info)

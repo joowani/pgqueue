@@ -1,0 +1,3 @@
+[migrate]
+create-schemas = ["pgqueue"]
+table-name = "pgqueue.migrations"

@@ -1,0 +1,119 @@
+# OS
+.DS_Store
+._*
+Desktop.ini
+Thumbs.db
+desktop.ini
+
+# Environment
+.direnv/
+.env
+.env.*
+!.env.example
+.envrc
+.envrc.*
+
+# Agents
+**/.claude/*.lock
+**/.claude/settings.local.json
+**/.claude/worktrees/
+.playwright-mcp/
+.worktrees/
+PLAN.md
+TODO.md
+plan.html
+plans/
+# Shared, despite any global ignore of .claude/settings.*.
+!.claude/settings.json
+
+# Editors
+*.iml
+*.sw[mnop]
+.cursor/
+.idea/
+.vs/
+.vscode/
+.zed/
+
+# Build
+build/
+debug/
+dist/
+out/
+target/
+
+# Temp
+*.tmp
+.cache/
+.temp/
+.tmp/
+temp/
+tmp/
+
+# Secrets
+*.jks
+*.key
+*.keystore
+*.p12
+*.pem
+*.pfx
+*service-account*.json
+.netrc
+application_default_credentials.json
+gha-creds-*.json
+id_ecdsa
+id_ed25519
+id_rsa
+
+# Backups
+**/*.rs.bk
+*.bak
+*.bk
+*.orig
+*.rej
+*~
+
+# Logs
+*.log
+*.log.[0-9]*
+*.log.gz
+
+# Databases
+*.db
+*.db-*
+.sqlx/
+
+# Testing
+*.profdata
+*.profraw
+coverage/
+lcov.info
+mutants.out*/
+perf.data*
+rustc-ice-*.txt
+
+# Playwright
+.playwright/
+playwright-report/
+test-results/
+
+# Node.js
+*.tsbuildinfo
+.pnpm-store/
+.tanstack/
+node_modules/
+
+# OpenTofu
+*.tfplan
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*_override.tf
+*_override.tf.json
+.terraform/
+.terraformrc
+override.tf
+override.tf.json
+terraform.rc
+tfplan
