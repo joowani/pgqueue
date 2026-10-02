@@ -24,7 +24,7 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98.1"
 license = "MIT"
@@ -40,7 +40,7 @@ hyper = { version = "1.10.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 jiff = { version = "0.2.35", features = ["serde"] }
 jiff-sqlx = { version = "0.2.0", features = ["postgres"] }
-pgqueue-macros = { path = "pgqueue-macros", version = "=0.1.0" }
+pgqueue-macros = { path = "pgqueue-macros", version = "=0.2.0" }
 proc-macro-crate = "3.5.0"
 proc-macro2 = "1.0.107"
 quote = "1.0.47"

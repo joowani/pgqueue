@@ -22,7 +22,7 @@ Add PGQueue to an application with:
 ```toml
 [dependencies]
 anyhow = "1"
-pgqueue = "0.1"
+pgqueue = "0.2"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -217,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
 Enable the `dashboard` feature to use the built-in web dashboard:
 
 ```toml
-pgqueue = { version = "0.1", features = ["dashboard"] }
+pgqueue = { version = "0.2", features = ["dashboard"] }
 ```
 
 The dashboard shows your queues, workers, and jobs. Run it as a standalone server behind a reverse proxy:
