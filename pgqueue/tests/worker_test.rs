@@ -1234,6 +1234,10 @@ async fn test_processors_observe_refills_without_polling_after_startup_race(pool
         .register_job(fills_worker_slot)
         .state(probe.clone())
         .concurrency(CONCURRENCY)
+        // This test isolates refill notifications. A 300 ms lease can expire
+        // while the completions wait for the fixture's five pooled connections
+        // on CI, letting the startup sweep recover otherwise successful jobs.
+        .timers(WorkerTimers { worker_info: Duration::from_secs(10), ..test_timers() })
         .poll_interval(Duration::from_secs(30))
         .build()
         .unwrap();
@@ -2702,11 +2706,17 @@ async fn test_burst_does_not_drain_when_worker_intake_is_closed(pool: PgPool) {
         list_workers(&control).await.iter().any(|worker| worker.id == worker_id).then_some(())
     })
     .await;
-    sqlx::query("UPDATE pgqueue.workers SET accepting = false, expires_at = now() - interval '1 second' WHERE id = $1")
-        .bind(worker_id)
-        .execute(control.pool())
-        .await
-        .unwrap();
+    // Keep the closed lease live: an expired one can be deleted by the startup
+    // sweep, after which a heartbeat creates an accepting replacement.
+    sqlx::query(
+        "UPDATE pgqueue.workers
+         SET accepting = false, expires_at = clock_timestamp() + interval '30 seconds'
+         WHERE id = $1",
+    )
+    .bind(worker_id)
+    .execute(control.pool())
+    .await
+    .unwrap();
     lock.rollback().await.unwrap();
 
     tokio::time::sleep(Duration::from_secs(7)).await;
