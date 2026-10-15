@@ -26,6 +26,16 @@ async fn cleanup(db: JobState<Db>) {
     let _ = db;
 }
 
+/// `(): ()` is the empty payload `clippy::ignored_unit_patterns` accepts, and neither handler awaits anything: the
+/// expansion takes each as a value before calling it, which is what keeps `clippy::unused_async` quiet on them.
+#[pgqueue::job]
+async fn unit_payload((): ()) {}
+
+#[pgqueue::cron("0 * * * *")]
+async fn hourly() -> anyhow::Result<()> {
+    Ok(())
+}
+
 fn main() {
     assert_eq!(work::NAME, "work");
     assert_eq!(cleanup::SCHEDULE, "*/5 * * * *");
@@ -34,4 +44,6 @@ fn main() {
     let _ = work::job(Payload { value: 1 });
     let _ = lowest_priority::job(());
     let _ = cleanup::job();
+    let _ = unit_payload::job(());
+    assert_eq!(hourly::SCHEDULE, "0 * * * *");
 }

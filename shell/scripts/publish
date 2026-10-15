@@ -4,15 +4,34 @@ set -euo pipefail
 
 cd "${BASH_SOURCE[0]%/*}/../.."
 
-# Publishes both crates, then tags the commit and creates the GitHub release. Needs `gh` signed in, or `GH_TOKEN` in CI.
+# Tags the commit, publishes both crates, and creates the GitHub release. Needs `gh` signed in, or `GH_TOKEN` in CI.
 # `--check` validates the version and stops, so the release workflow can reject a bad input before running the tests.
-check_only=false
-if [[ ${1:-} == --check ]]; then
-    check_only=true
-    shift
-fi
+usage="usage: shell/scripts/publish [--check] <version>"
 
-version="${1:?usage: shell/scripts/publish [--check] <version>}"
+# Every argument is read, so `--check` counts in any position and anything unexpected is refused: a flag after the
+# version used to be ignored, which turned a check into a real, irreversible release.
+check_only=false
+version=""
+for argument in "$@"; do
+    case "$argument" in
+        --check) check_only=true ;;
+        -*)
+            echo "unknown option $argument; $usage" >&2
+            exit 2
+            ;;
+        *)
+            if [[ -n $version ]]; then
+                echo "$usage" >&2
+                exit 2
+            fi
+            version="$argument"
+            ;;
+    esac
+done
+if [[ -z $version ]]; then
+    echo "$usage" >&2
+    exit 2
+fi
 
 # Require a bare `x.y.z`, so neither a tag-shaped `v1.2.3` nor a pre-release suffix reaches `cargo publish`.
 if [[ ! $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
@@ -23,6 +42,45 @@ fi
 workspace_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
 if [[ $version != "$workspace_version" ]]; then
     echo "requested version $version does not match the workspace version $workspace_version" >&2
+    exit 1
+fi
+
+user_agent="pgqueue release workflow (https://github.com/joowani/pgqueue)"
+
+# A released migration can never change. The migrator refuses a database whose history records another checksum for a
+# version, so editing one in place leaves every database that release migrated unable to connect, as 0.2.0's edit of
+# migration 1 did to databases 0.1.0 had migrated. The latest release carries every migration released so far.
+# An answer this cannot read stops the release rather than skipping the comparison.
+released="$(curl --silent --show-error --fail --user-agent "$user_agent" "https://crates.io/api/v1/crates/pgqueue" |
+    sed -n 's/.*"max_stable_version":"\([^"]*\)".*/\1/p')"
+if [[ ! $released =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "crates.io did not name the latest pgqueue release, so its migrations cannot be compared" >&2
+    exit 1
+fi
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+curl --silent --show-error --fail --location --user-agent "$user_agent" \
+    "https://static.crates.io/crates/pgqueue/pgqueue-$released.crate" | tar -xzf - -C "$scratch"
+for path in "$scratch/pgqueue-$released"/migrations/*.sql; do
+    if ! cmp -s "$path" "pgqueue/migrations/${path##*/}"; then
+        echo "pgqueue/migrations/${path##*/} differs from pgqueue $released; add a new migration instead" >&2
+        exit 1
+    fi
+done
+
+# A migration the latest release lacks makes this release breaking: processes of any older release refuse a database
+# it migrated, so a fleet mid-deploy stops connecting. It must not reach `pgqueue = "x.y"` users through `cargo update`,
+# so the version has to be one Cargo treats as incompatible with the latest release's: a new minor while the major is 0.
+new_migrations=0
+for path in pgqueue/migrations/*.sql; do
+    [[ -f "$scratch/pgqueue-$released/migrations/${path##*/}" ]] || new_migrations=$((new_migrations + 1))
+done
+IFS=. read -r released_major released_minor _ <<<"$released"
+IFS=. read -r major minor _ <<<"$version"
+if (( new_migrations > 0 )) &&
+    (( released_major == 0 ? (major == 0 && minor <= released_minor) : (major <= released_major) )); then
+    echo "version $version adds migrations to pgqueue $released, which older processes refuse; release a" \
+        "breaking version instead" >&2
     exit 1
 fi
 
@@ -44,7 +102,8 @@ if tag_ref_response="$(gh api --include "repos/{owner}/{repo}/git/ref/tags/v$ver
         exit 1
     fi
     if [[ $tag_commit != "$commit" ]]; then
-        echo "tag v$version points to $tag_commit instead of $commit" >&2
+        echo "tag v$version points to $tag_commit instead of $commit; if neither crate is on crates.io yet, delete" \
+            "the tag with \`gh api -X DELETE 'repos/{owner}/{repo}/git/refs/tags/v$version'\` and run again" >&2
         exit 1
     fi
     tag_exists=true
@@ -60,7 +119,17 @@ if [[ $check_only == true ]]; then
     exit 0
 fi
 
-user_agent="pgqueue release workflow (https://github.com/joowani/pgqueue)"
+# Package and verify both crates first, so a crate that does not build or package fails before the tag below claims
+# the version, which would then have to be deleted by hand to release a fix from another commit. A refusal by
+# crates.io itself still comes after the tag.
+cargo package --workspace --locked
+
+# Claim the version for this commit before anything irreversible: once the tag exists, a run from any other commit
+# stops at the tag check above. Tagging only after publishing let a run repeated after a failed release tag, and
+# release, a newer commit than the one crates.io serves.
+if [[ $tag_exists == false ]]; then
+    gh api --method POST 'repos/{owner}/{repo}/git/refs' -f ref="refs/tags/v$version" -f sha="$commit" >/dev/null
+fi
 
 # Read the status code, since `curl --fail` cannot tell a network failure from a 404.
 crate_exists() {
@@ -90,11 +159,9 @@ else
     echo "both crates are already published at $version; nothing to do"
 fi
 
-# Every step is idempotent, so a run that failed partway can simply be repeated.
+# Every step is idempotent, so a run that failed partway can simply be repeated from the same commit.
 if gh release view "v$version" >/dev/null 2>&1; then
     echo "release v$version already exists; nothing to do"
-elif [[ $tag_exists == true ]]; then
-    gh release create "v$version" --verify-tag --title "v$version" --generate-notes
 else
-    gh release create "v$version" --target "$commit" --title "v$version" --generate-notes
+    gh release create "v$version" --verify-tag --title "v$version" --generate-notes
 fi

@@ -4,9 +4,9 @@
 //! `DATABASE_URL=postgres://pgqueue:pgqueue@localhost:3532/pgqueue \
 //!  PGQUEUE_DASHBOARD_PASSWORD=local-password cargo run --features dashboard --example dashboard`
 //!
-//! It is set up for opening <http://localhost:8080> directly rather than through the README's reverse proxy: plain
-//! HTTP needs `secure_cookies(false)`, no public host name needs allowing, and with no proxy in front
-//! `trusted_proxy_hops` keeps its default of `0` — set to `1`, it would trust whatever `X-Forwarded-For` a client wrote.
+//! It is set up for opening <http://localhost:8080> directly rather than through the README's reverse proxy: plain HTTP
+//! needs `secure_cookies(false)`, no public host name needs allowing, and with no proxy in front `trusted_proxy_hops`
+//! keeps its default of `0` — set to `1`, it would trust whatever `X-Forwarded-For` a client wrote.
 
 use pgqueue::{Dashboard, Queue};
 

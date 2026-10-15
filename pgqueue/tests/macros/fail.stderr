@@ -40,7 +40,7 @@ error: `revision` is only valid on #[pgqueue::cron]
 19 | #[pgqueue::job(revision = 1)]
    |                ^^^^^^^^
 
-error: #[pgqueue::job] functions need a payload as their first parameter; use `_: ()` for jobs without one
+error: #[pgqueue::job] functions need a payload as their first parameter; use `_: ()` for jobs without one, or `(): ()`, which `clippy::ignored_unit_patterns` accepts
   --> tests/macros/fail.rs:23:10
    |
 23 | async fn no_payload() {}
@@ -253,6 +253,72 @@ error: #[pgqueue::cron] functions cannot return a borrowed type; the output is s
 218 | async fn nested_borrowed_output() -> anyhow::Result<Option<&str>> {
     |                                                            ^^^^
 
+error: expected `key = value`, such as `name = "..."`; #[pgqueue::job] takes no positional argument
+   --> tests/macros/fail.rs:238:16
+    |
+238 | #[pgqueue::job("send_email")]
+    |                ^^^^^^^^^^^^
+
+error: #[pgqueue::job] takes no schedule; for a recurring job, use #[pgqueue::cron("0 * * * *")]
+   --> tests/macros/fail.rs:241:16
+    |
+241 | #[pgqueue::job("0 * * * *")]
+    |                ^^^^^^^^^^^
+
+error: expected `key = value`, such as `name = "..."`; only the schedule is positional
+   --> tests/macros/fail.rs:244:30
+    |
+244 | #[pgqueue::cron("* * * * *", "hourly")]
+    |                              ^^^^^^^^
+
+error: expected `key = value`, such as `name = "..."`; #[pgqueue::job] takes no positional argument
+   --> tests/macros/fail.rs:248:16
+    |
+248 | #[pgqueue::job("send the welcome email now")]
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: expected `key = value`, such as `name = "..."`; #[pgqueue::job] takes no positional argument
+   --> tests/macros/fail.rs:251:34
+    |
+251 | #[pgqueue::job(max_attempts = 2, "send_email")]
+    |                                  ^^^^^^^^^^^^
+
+error: expected `key = value`, such as `name = "..."`; #[pgqueue::job] takes no positional argument
+   --> tests/macros/fail.rs:261:12
+    |
+261 | job_named!("send_email");
+    |            ^^^^^^^^^^^^
+
+error: expected `key = value`; see the pgqueue::cron docs
+   --> tests/macros/fail.rs:264:30
+    |
+264 | #[pgqueue::cron("* * * * *", name("hourly"))]
+    |                              ^^^^^^^^^^^^^^
+
+error: job name must be 1..=255 bytes and contain no NUL
+   --> tests/macros/fail.rs:268:23
+    |
+268 | #[pgqueue::job(name = "a\0b")]
+    |                       ^^^^^^
+
+error: expected a simple attribute name
+   --> tests/macros/fail.rs:271:16
+    |
+271 | #[pgqueue::job(pgqueue::name = "x")]
+    |                ^^^^^^^^^^^^^
+
+error: #[pgqueue::job] functions cannot take a borrowed payload; it is deserialized from storage, so it must be owned; a `Cow` written without a lifetime borrows, so write `Cow<'static, str>`, or `std::borrow::Cow<'static, str>` where `Cow` names an alias
+   --> tests/macros/fail.rs:276:33
+    |
+276 | async fn elided_cow_lifetime(_: std::borrow::Cow<str>) {}
+    |                                 ^^^^^^^^^^^^^^^^^^^^^
+
+error: the first parameter of a #[pgqueue::job] function is its payload; for a job without one, write `_: ()` or `(): ()` first and take the `JobContext` after it, or, if `JobContext` is a payload type of your own, write it through its module path, such as `crate::JobContext`
+   --> tests/macros/fail.rs:280:36
+    |
+280 | async fn extractor_as_payload(ctx: pgqueue::JobContext) {}
+    |                                    ^^^^^^^^^^^^^^^^^^^
+
 error: malformed `expect` attribute input
    --> tests/macros/fail.rs:108:1
     |
@@ -346,17 +412,19 @@ note: required by a bound in `pgqueue::JobType::Args`
     |     type Args: Serialize + DeserializeOwned + Send + 'static;
     |                ^^^^^^^^^ required by this bound in `JobType::Args`
 
-error[E0277]: the trait bound `NotAnExtractor: FromJobContext` is not satisfied
+error[E0277]: `NotAnExtractor` is not a job context extractor
   --> tests/macros/fail.rs:71:38
    |
 71 | async fn bad_extractor(_: (), value: NotAnExtractor) {
-   |                                      ^^^^^^^^^^^^^^ unsatisfied trait bound
+   |                                      ^^^^^^^^^^^^^^ not an extractor
    |
 help: the trait `FromJobContext` is not implemented for `NotAnExtractor`
   --> tests/macros/fail.rs:68:1
    |
 68 | struct NotAnExtractor;
    | ^^^^^^^^^^^^^^^^^^^^^
+   = note: every parameter of a #[pgqueue::cron] function is an extractor, such as `JobContext` or `JobState<T>`: crons take no payload
+   = note: every parameter of a #[pgqueue::job] function after the first, its payload, is an extractor
 help: the following other types implement trait `FromJobContext`
   --> src/job.rs
    |
@@ -366,17 +434,19 @@ help: the following other types implement trait `FromJobContext`
    | impl<T: Clone + Send + Sync + 'static> FromJobContext for JobState<T> {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `JobState<T>`
 
-error[E0277]: the trait bound `Payload: FromJobContext` is not satisfied
+error[E0277]: `Payload` is not a job context extractor
   --> tests/macros/fail.rs:79:30
    |
 79 | async fn cron_payload(value: Payload) {
-   |                              ^^^^^^^ unsatisfied trait bound
+   |                              ^^^^^^^ not an extractor
    |
 help: the trait `FromJobContext` is not implemented for `Payload`
   --> tests/macros/fail.rs:76:1
    |
 76 | struct Payload;
    | ^^^^^^^^^^^^^^
+   = note: every parameter of a #[pgqueue::cron] function is an extractor, such as `JobContext` or `JobState<T>`: crons take no payload
+   = note: every parameter of a #[pgqueue::job] function after the first, its payload, is an extractor
 help: the following other types implement trait `FromJobContext`
   --> src/job.rs
    |
@@ -447,6 +517,24 @@ note: required by a bound in `pgqueue::__private::decode_payload`
     |
     |     pub fn decode_payload<T: DeserializeOwned>(payload: &Value) -> Result<T, JobError> {
     |                              ^^^^^^^^^^^^^^^^ required by this bound in `decode_payload`
+
+error[E0277]: `()` is not a job context extractor
+   --> tests/macros/fail.rs:284:33
+    |
+284 | async fn cron_with_a_payload(_: ()) {}
+    |                                 ^^ not an extractor
+    |
+    = help: the trait `FromJobContext` is not implemented for `()`
+    = note: every parameter of a #[pgqueue::cron] function is an extractor, such as `JobContext` or `JobState<T>`: crons take no payload
+    = note: every parameter of a #[pgqueue::job] function after the first, its payload, is an extractor
+help: the following other types implement trait `FromJobContext`
+   --> src/job.rs
+    |
+    | impl FromJobContext for JobContext {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `JobContext`
+...
+    | impl<T: Clone + Send + Sync + 'static> FromJobContext for JobState<T> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `JobState<T>`
 
 error: future cannot be sent between threads safely
    --> tests/macros/fail.rs:230:39

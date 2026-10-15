@@ -140,9 +140,12 @@ pub use worker::{
 /// no scheduler was *able* to publish, not ones withheld because the previous
 /// run is still alive.
 ///
-/// The guarantee covers *scheduled* occurrences. Manually retrying a terminal occurrence
-/// ([`Queue::retry_job`]) deliberately produces a keyless one-off outside the schedule, which can
-/// run beside a live scheduled occurrence; see that method's documentation.
+/// The guarantee covers *scheduled* occurrences whose handlers stop when their attempt ends. Manually retrying a
+/// terminal occurrence ([`Queue::retry_job`]) deliberately produces a keyless one-off outside the schedule, which can
+/// run beside a live scheduled occurrence; see that method's documentation. And an attempt ends, releasing the key for
+/// the next occurrence, even when its handler cannot be stopped: a handler that blocks its thread past `timeout_ms`,
+/// or one still running when a shutdown gives up waiting on it, keeps running beside the next occurrence, as can an
+/// attempt whose worker's lease stalled (see [`WorkerTimers::worker_info`](crate::WorkerTimers::worker_info)).
 ///
 /// Like [`macro@job`], the annotated function must be a free function at module or block scope,
 /// `#[expect(...)]` on it behaves as `#[allow(...)]`, and a `#[deprecated]` one needs
@@ -194,10 +197,19 @@ pub use pgqueue_macros::cron;
 /// Marks an `async fn` as a job handler.
 ///
 /// The first parameter is the job's payload — use `_: ()` for a job that takes
-/// none — and every parameter after it is an extractor ([`JobState`],
-/// [`JobContext`]). The expansion adds `::job(args)` for building an enqueue
-/// request, `::call(..)` for invoking the handler directly, and a [`JobType`]
-/// implementation carrying the configuration below.
+/// none, or `(): ()`, which `clippy::ignored_unit_patterns` accepts — and every
+/// parameter after it is an extractor ([`JobState`], [`JobContext`]). The
+/// expansion adds `::job(args)` for building an enqueue request, `::call(..)`
+/// for invoking the handler directly, and a [`JobType`] implementation carrying
+/// the configuration below.
+///
+/// The handler returns `()`, or a `Result<T, E>`: `Ok(T)` is stored as the job's JSON result, so `T` must be
+/// `Serialize + DeserializeOwned + Send + 'static` (`()` for none). `Err(E)` fails the attempt, so `E` must be
+/// `Display + 'static`: an `anyhow::Error` is stored with its whole cause chain (`{:#}`), and any other `E` as its
+/// `Display` text. A [`JobError`] — returned as `E`, or found in an `anyhow::Error`'s or a boxed error's chain — keeps
+/// its kind and message instead, so an `Aborted` one returned during a shutdown gives the attempt back rather than
+/// failing it. A handler returning anything else fails to compile with an error naming the trait that encodes this,
+/// `IntoJobResult`.
 ///
 /// The annotated function must be a free function at module or block scope: the expansion writes a
 /// struct and three `impl` blocks beside it, none of which is legal inside another `impl` or a

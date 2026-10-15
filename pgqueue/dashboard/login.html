@@ -16,14 +16,14 @@
              aria-hidden="true">
         <span>PGQueue</span>
       </h1>
-      <p class="error" role="alert">{error}</p>
+      <p class="error" id="login-error" role="alert">{error}</p>
       <form method="post" action="{root}/login">
         <label for="username">Username</label>
         <input id="username" name="username" type="text" autocomplete="username"
-               autocapitalize="none" spellcheck="false" required autofocus>
+               autocapitalize="none" spellcheck="false" aria-describedby="login-error" required autofocus>
         <label for="password">Password</label>
         <input id="password" name="password" type="password"
-               autocomplete="current-password" required>
+               autocomplete="current-password" aria-describedby="login-error" required>
         <button type="submit">Sign in</button>
       </form>
     </article>

@@ -233,4 +233,54 @@ async fn not_send_across_await(_: ()) {
     drop(local);
 }
 
+// A bare string reads as a positional name, by analogy with the cron schedule; left to `syn` it was refused as
+// "expected identifier", which names neither the key nor the form. On a job, a schedule means a cron was meant.
+#[pgqueue::job("send_email")]
+async fn positional_job_name(_: ()) {}
+
+#[pgqueue::job("0 * * * *")]
+async fn schedule_on_a_job(_: ()) {}
+
+#[pgqueue::cron("* * * * *", "hourly")]
+async fn positional_cron_name() {}
+
+// Five words that are no schedule are a positional name, and a string after a valid item is the same mistake.
+#[pgqueue::job("send the welcome email now")]
+async fn five_words_on_a_job(_: ()) {}
+
+#[pgqueue::job(max_attempts = 2, "send_email")]
+async fn trailing_positional_name(_: ()) {}
+
+// The same string through a `macro_rules!` fragment, which arrives in an invisible group.
+macro_rules! job_named {
+    ($name:literal) => {
+        #[pgqueue::job($name)]
+        async fn grouped_positional_name(_: ()) {}
+    };
+}
+job_named!("send_email");
+
+// A cron's error points at the cron's documentation, not the job's.
+#[pgqueue::cron("* * * * *", name("hourly"))]
+async fn cron_call_syntax() {}
+
+// A NUL fails every enqueue at runtime, and a path is not the `name` key.
+#[pgqueue::job(name = "a\0b")]
+async fn nul_in_name(_: ()) {}
+
+#[pgqueue::job(pgqueue::name = "x")]
+async fn path_key(_: ()) {}
+
+// `Cow<str>` leaves its lifetime out, so it borrows like `&str`; the error shows the owned spelling.
+#[pgqueue::job]
+async fn elided_cow_lifetime(_: std::borrow::Cow<str>) {}
+
+// An extractor written first is the payload to the expansion, which failed as `serde` errors on `JobContext`.
+#[pgqueue::job]
+async fn extractor_as_payload(ctx: pgqueue::JobContext) {}
+
+// A cron takes no payload: every parameter is an extractor, and the unsatisfied bound says so.
+#[pgqueue::cron("* * * * *")]
+async fn cron_with_a_payload(_: ()) {}
+
 fn main() {}

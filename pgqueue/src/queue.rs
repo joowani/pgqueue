@@ -36,7 +36,8 @@ pub struct QueueCounts {
     /// Jobs queued for a future execution time.
     pub scheduled: i64,
     /// Retained jobs whose handler reported an error on their last allowed
-    /// attempt.
+    /// attempt, and jobs a claim failed because their stored JSON could not be
+    /// read, which no handler can run.
     ///
     /// Not every exhausted job: an attempt the [`Sweeper`]
     /// recovers never reports a handler error, so when it was the last one the
@@ -69,7 +70,8 @@ pub struct QueueCounts {
 pub struct QueueStats {
     /// Jobs finished successfully.
     pub complete: u64,
-    /// Jobs whose handler reported an error on their last allowed attempt.
+    /// Jobs whose handler reported an error on their last allowed attempt, and
+    /// jobs a claim failed because their stored JSON could not be read.
     /// Exhausting the attempts by way of the [`Sweeper`] counts
     /// under [`QueueStats::aborted`] instead — see [`QueueCounts::failed`].
     pub failed: u64,
@@ -212,12 +214,12 @@ const LISTENER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
 
 /// How the notification listener proves that a session with nothing to say is still there.
 ///
-/// A `LISTEN` session that receives nothing sends nothing, and sqlx sets no TCP keepalive, so a connection a NAT or load
-/// balancer silently dropped for idleness — about six minutes behind an AWS NLB — read as a quiet channel for as long
-/// as the process ran: every wakeup and completion event lost, workers and waits carried by their polling fallbacks,
-/// and [`QueueNotifyListener::subscribe_health`] still reporting a healthy subscription. After `idle` without a message
-/// the listener runs a trivial statement on the session, which also keeps a middlebox's idle timer from expiring, and a
-/// session that does not answer it within `timeout` is replaced.
+/// A `LISTEN` session that receives nothing sends nothing, and sqlx sets no TCP keepalive, so a connection a NAT or
+/// load balancer silently dropped for idleness — about six minutes behind an AWS NLB — read as a quiet channel for as
+/// long as the process ran: every wakeup and completion event lost, workers and waits carried by their polling
+/// fallbacks, and [`QueueNotifyListener::subscribe_health`] still reporting a healthy subscription. After `idle`
+/// without a message the listener runs a trivial statement on the session, which also keeps a middlebox's idle timer
+/// from expiring, and a session that does not answer it within `timeout` is replaced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ListenerProbe {
     pub(crate) idle: Duration,
@@ -328,7 +330,11 @@ impl QueueNotifyListener {
                     // about a quarter of an hour of retransmissions — holding the pool's one slot, and every reconnect
                     // would queue behind it. The stale pool is left to that task and the reconnect takes a fresh one.
                     pool = listener_pool(&connect_options);
-                    tracing::warn!(queue = %queue_name, %error, "notification listener stopped answering; reconnecting");
+                    tracing::warn!(
+                        queue = %queue_name,
+                        %error,
+                        "notification listener stopped answering; reconnecting"
+                    );
                     continue;
                 };
                 match received {
@@ -779,10 +785,14 @@ impl QueueBuilder {
     /// PGQueue migrations.
     ///
     /// A current migration history is checked without DDL or the migrator's
-    /// advisory lock. Applying a migration needs DDL privileges. A deployment
-    /// with a restricted application role can run the published
-    /// `pgqueue-migrate` command with a schema-owner role before starting the
-    /// application. Migration history does not detect or repair tables, indexes,
+    /// advisory lock, which only needs `SELECT` on `pgqueue.migrations`. Applying
+    /// a migration needs the role that owns the `pgqueue` schema and its tables,
+    /// or a member of it: `CREATE` on that schema, or `CREATE` on the database
+    /// while it does not exist yet, plus ownership of what the migrations alter.
+    /// A migration a role without it cannot apply fails rather than being
+    /// recorded half done. A deployment with a restricted application role can
+    /// run the published `pgqueue-migrate` command with the schema owner before
+    /// starting the application. Migration history does not detect or repair tables, indexes,
     /// or other objects changed manually after a migration ran.
     ///
     /// # Durability
@@ -1066,8 +1076,10 @@ impl Queue {
     /// counted — live, failed and aborted jobs — rather than the queue's total
     /// retained history. Retained `complete` rows are never read.
     ///
-    /// The `pg_monitor` role can read every PGQueue table, so a metrics
-    /// exporter needs no custom grant.
+    /// The `pg_monitor` role can read every column this reads, so a metrics
+    /// exporter connecting as it needs no custom grant, provided the schema's
+    /// owner applied the migrations. It cannot read the documents applications
+    /// store: payloads, results, errors, metadata and dedupe keys.
     pub async fn counts(&self) -> Result<QueueCounts, Error> {
         self.database.counts().await
     }

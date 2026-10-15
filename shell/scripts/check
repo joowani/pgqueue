@@ -4,38 +4,106 @@ set -euo pipefail
 
 cd "${BASH_SOURCE[0]%/*}/../.."
 
+# Each check is a function, so prek can run it as its own hook, scoped to the files it reads. Name checks to run only
+# those, as in `shell/scripts/check fmt clippy`; with no arguments, every check runs, cheapest first.
+checks=(migrations width fmt audit clippy)
+
 # Enforce NNNN_migration.sql numbering so two branches cannot claim the same version.
-shopt -s nullglob
-expected=1
-for path in pgqueue/migrations/*.sql; do
-    name="$(printf '%04d_migration.sql' "$expected")"
-    if [[ ${path##*/} != "$name" ]]; then
-        echo "$path: migration must be named $name" >&2
-        exit 1
+migrations() {
+    local path name expected=1
+    shopt -s nullglob
+    for path in pgqueue/migrations/*.sql; do
+        name="$(printf '%04d_migration.sql' "$expected")"
+        if [[ ${path##*/} != "$name" ]]; then
+            echo "$path: migration must be named $name" >&2
+            return 1
+        fi
+        expected=$((expected + 1))
+    done
+}
+
+# Prose must fit in 120 characters: Markdown outside code blocks and tables, and full-line comments in code. A lone
+# token, such as a URL, is let through, since it cannot wrap. Perl counts characters rather than bytes, so non-ASCII
+# text such as Korean is measured correctly. Vendored files and verbatim fixtures are not ours to rewrap.
+width() {
+    git ls-files -z '*.md' '*.rs' '*.mjs' '*.css' '*.toml' '*.yml' '*.yaml' '*.sql' 'shell/scripts/*' \
+        ':!:*.min.css' ':!:pgqueue/tests/fixtures/**' | xargs -0 perl -e "$(cat <<'PERL'
+use strict;
+use warnings;
+my $bad = 0;
+for my $path (@ARGV) {
+    open(my $file, '<:encoding(UTF-8)', $path) or die "$path: $!";
+    my ($kind) = $path =~ /\.(md|rs|mjs|js|css|toml|ya?ml|sql)$/;
+    $kind //= 'sh';
+    my ($fence, $block) = ('', 0);
+    while (my $line = <$file>) {
+        chomp $line;
+        my $prose = 0;
+        if ($kind eq 'md') {
+            # \x60 is a backtick, spelled out because bash 3.2 reads a literal one inside $(...) as a substitution.
+            if ($line =~ /^\s*(\x60{3,}|~{3,})/) {
+                my $marker = $1;
+                if ($fence eq '') { $fence = $marker; }
+                elsif (substr($marker, 0, 1) eq substr($fence, 0, 1) && length($marker) >= length($fence)) { $fence = ''; }
+                next;
+            }
+            $prose = $fence eq '' && $line !~ /^\s*\|/;
+        } elsif ($kind =~ /^(rs|mjs|js|css)$/) {
+            if ($block) { $prose = 1; $block = 0 if $line =~ m{\*/}; }
+            elsif ($line =~ m{^\s*/\*}) { $prose = 1; $block = 1 unless $line =~ m{\*/}; }
+            elsif ($kind ne 'css' && $line =~ m{^\s*//}) { $prose = 1; }
+        } elsif ($kind eq 'sql') {
+            $prose = $line =~ /^\s*--/;
+        } else {
+            $prose = $line =~ /^\s*#/ && $line !~ /^#!/;
+        }
+        # A lone token, such as a URL, cannot wrap.
+        next if !$prose || length($line) <= 120 || $line =~ /^\s*(?:\S+\s+)?\S+$/;
+        print "$path:$.: line is ", length($line), " characters (max 120)\n";
+        $bad = 1;
+    }
+    close $file;
+}
+exit $bad;
+PERL
+)"
+}
+
+fmt() {
+    cargo fmt --all -- --check
+}
+
+audit() {
+    cargo audit --deny yanked
+}
+
+clippy() {
+    # Cargo never removes stale artifacts, so the target directory only grows. Past the size limit, start it over and
+    # let clippy rebuild what it needs. Set CARGO_TARGET_LIMIT_GB to change the limit. Measure the directory that
+    # `cargo clean` empties, which CARGO_TARGET_DIR moves.
+    local limit_gb="${CARGO_TARGET_LIMIT_GB:-20}" target_dir="${CARGO_TARGET_DIR:-target}" size_kb
+    size_kb="$({ du -sk "${target_dir}" || true; } 2> /dev/null | awk '{ print $1 }')"
+    if (( ${size_kb:-0} > limit_gb * 1024 * 1024 )); then
+        printf '%s is %d GB, over the %d GB limit: cleaning it\n' "${target_dir}" $(( size_kb / 1024 / 1024 )) \
+            "${limit_gb}"
+        cargo clean
     fi
-    expected=$((expected + 1))
-done
 
-# Markdown prose must fit in 120 characters. Code blocks and table rows are skipped because they cannot wrap.
-# Perl counts characters rather than bytes, so non-ASCII text such as Korean is measured correctly.
-git ls-files -z '*.md' | xargs -0 perl -CSD -lne '
-  if (/^\s*(```|~~~)/) { $fenced = !$fenced; next }
-  if (!$fenced && !/^\s*\|/ && length > 120) { print "$ARGV:$.: line is ", length, " characters (max 120)"; $bad = 1 }
-  END { exit $bad }
-} continue { if (eof) { close ARGV; $fenced = 0 }'
+    # Lint each build users can get on its own, since compiling tests enables a test-only feature they never get: the
+    # default one, and the one with the dashboard, which docs.rs builds too. Neither compiles the tests, so neither
+    # pulls in the dev-dependency that turns the test-only feature on.
+    cargo clippy --locked --quiet --workspace --lib --bins -- -D warnings
+    cargo clippy --locked --quiet --package pgqueue --lib --bins --features dashboard -- -D warnings
+    cargo clippy --locked --quiet --workspace --all-targets --all-features -- -D warnings
+}
 
-# Cargo never removes stale artifacts, so the target directory only grows. Past the size limit, start it over and let
-# clippy rebuild what it needs. Set CARGO_TARGET_LIMIT_GB to change the limit.
-limit_gb="${CARGO_TARGET_LIMIT_GB:-20}"
-size_kb="$({ du -sk target || true; } 2> /dev/null | awk '{ print $1 }')"
-if (( ${size_kb:-0} > limit_gb * 1024 * 1024 )); then
-    printf 'target is %d GB, over the %d GB limit: cleaning it\n' $(( size_kb / 1024 / 1024 )) "${limit_gb}"
-    cargo clean
+if (( $# == 0 )); then
+    set -- "${checks[@]}"
 fi
-
-cargo fmt --all -- --check
-cargo audit --deny yanked
-
-# Lint the published build separately, since compiling tests enables a test-only feature users never get.
-cargo clippy --locked --quiet --workspace --lib --bins -- -D warnings
-cargo clippy --locked --quiet --workspace --all-targets --all-features -- -D warnings
+for check in "$@"; do
+    if [[ " ${checks[*]} " != *" $check "* ]]; then
+        echo "unknown check $check; expected one of: ${checks[*]}" >&2
+        exit 2
+    fi
+    "$check"
+done

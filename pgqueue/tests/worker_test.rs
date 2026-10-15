@@ -4200,9 +4200,9 @@ impl SilenceableRelay {
     }
 }
 
-/// A `LISTEN` session that stops answering — dropped for idleness by a NAT or load balancer, with neither end told — has
-/// to be noticed and replaced. It receives nothing and sends nothing, and sqlx sets no TCP keepalive, so it read as a
-/// quiet channel for as long as the process ran: every wakeup and completion event lost, and the health watch
+/// A `LISTEN` session that stops answering — dropped for idleness by a NAT or load balancer, with neither end told —
+/// has to be noticed and replaced. It receives nothing and sends nothing, and sqlx sets no TCP keepalive, so it read as
+/// a quiet channel for as long as the process ran: every wakeup and completion event lost, and the health watch
 /// reporting a healthy subscription throughout.
 #[sqlx::test(migrations = "./migrations")]
 async fn test_notification_listener_replaces_a_session_that_stopped_answering(pool: PgPool) {
@@ -6232,6 +6232,62 @@ async fn test_a_burst_worker_drains_behind_a_locked_prefix(pool: PgPool) {
     // The seven rows nobody holds must have run, not been reported as drained.
     assert_eq!(counter.load(Ordering::SeqCst), 7, "the burst reported a drain it had not achieved");
     lock.rollback().await.unwrap();
+}
+
+/// A claim that takes only rows whose stored JSON cannot be read fails them in its transaction and returns nothing,
+/// which the fetch loop read as lock contention: it backed off, and a burst concluded a drain with readable jobs still
+/// queued behind the unreadable ones. Every such claim is progress, so the burst keeps fetching and runs them. Enough
+/// rows that working through them on the contention backoff outlasts the burst's patience.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_a_burst_worker_runs_the_jobs_queued_behind_unreadable_rows(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let nested = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+    sqlx::query(
+        "INSERT INTO pgqueue.jobs (queue, name, payload, priority)
+         SELECT $1, 'counts', $2::jsonb, -1 FROM generate_series(1, 200)",
+    )
+    .bind(db.queue.name())
+    .bind(&nested)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for _ in 0..5 {
+        db.queue.enqueue(counts::job(())).await.unwrap().unwrap();
+    }
+
+    let counter = Arc::new(AtomicU32::new(0));
+    let worker = test_worker(db.queue.clone())
+        .register_job(counts)
+        .state(counter.clone())
+        .concurrency(2)
+        .burst(true)
+        .dequeue_timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let worker_id = worker.id();
+    tokio::time::timeout(Duration::from_secs(30), worker.run_until(CancellationToken::new()))
+        .await
+        .expect("burst worker did not finish")
+        .unwrap();
+
+    assert_eq!(counter.load(Ordering::SeqCst), 5, "the burst stopped short of the readable jobs");
+    let failed = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pgqueue.jobs WHERE queue = $1 AND status = 'failed' AND worker_id = $2",
+    )
+    .bind(db.queue.name())
+    .bind(worker_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failed, 200);
+    // Failed under this worker's id, so they count in its own stats too.
+    let reported =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT (stats->>'failed')::bigint FROM pgqueue.workers WHERE id = $1")
+            .bind(worker_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reported, Some(200));
 }
 
 // ---------------------------------------------------------------------------

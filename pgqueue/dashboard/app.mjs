@@ -7,6 +7,9 @@ export const cursorView = () => ({
   limit: 25,
 });
 
+// Where layout() divides the page's content into its parts, which a repaint replaces one at a time (see paint).
+export const PART_BREAK = "<!-- part -->";
+
 export const escapeHtml = (value) =>
   String(value).replace(/[&<>"']/g, (character) => ({
     "&": "&amp;",
@@ -148,8 +151,8 @@ export const parseRoute = (pathname, root) => {
 export const exceedsJobNameLimit = (name) => new TextEncoder().encode(name).length > 255;
 
 // A filter no job name can match, which the listing refuses outright: past the length limit, or carrying a NUL, which
-// PostgreSQL text cannot hold. Asked of the server, the refusal replaced the whole page — search box included — on every
-// poll, and filters survive navigation, so only a reload or another queue cleared it.
+// PostgreSQL text cannot hold. Asked of the server, the refusal replaced the whole page — search box included — on
+// every poll, and filters survive navigation, so only a reload or another queue cleared it.
 export const matchesNoJobName = (name) => name.includes("\0") || exceedsJobNameLimit(name);
 
 export const isSuggestionResponseCurrent = (view, requestId, prefix) =>
@@ -187,6 +190,9 @@ const startDashboard = () => {
   };
   const DASHBOARD_TIME_ZONE = usableTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
   const app = document.getElementById("app");
+  // The one live region, kept outside #app by index.html so that no paint replaces it: a region a repaint swaps in, or
+  // one unhidden in the same step that fills it, is often never read out.
+  const announcer = document.getElementById("announcer");
   const REFRESH_MS = 5000;
   const ACCOUNT_MESSAGE_MS = 10000;
 
@@ -290,7 +296,7 @@ const startDashboard = () => {
       ? '<span class="truncated" title="stats exceeded the response cap">… truncated</span>'
       : esc(render(worker.stats?.[key]));
 
-  // calendar/numberingSystem are load-bearing: whenText pastes these parts into
+  // calendar/numberingSystem are load-bearing: clockText pastes these parts into
   // a fixed YYYY-MM-DD, and a locale default would render th-TH as Buddhist 2569
   // or fa-IR in Persian digits, disagreeing with the ISO `datetime=` when()
   // writes on the same element.
@@ -298,7 +304,6 @@ const startDashboard = () => {
   const calendarOptions = {
     calendar: "gregory",
     numberingSystem: "latn",
-    timeZone: DASHBOARD_TIME_ZONE,
   };
 
   /** @type {Intl.DateTimeFormatOptions} */
@@ -308,7 +313,6 @@ const startDashboard = () => {
     day: "2-digit",
     ...calendarOptions,
   };
-  const dateFormat = new Intl.DateTimeFormat(undefined, dateOptions);
 
   /** @type {Intl.DateTimeFormatOptions} */
   const timeOptions = {
@@ -318,29 +322,33 @@ const startDashboard = () => {
     hourCycle: "h23",
     ...calendarOptions,
   };
-  const timeFormat = new Intl.DateTimeFormat(undefined, timeOptions);
+
+  // A timestamp is printed in two zones: the browser's for its text, UTC for its title.
+  const clockFormats = (timeZone) => ({
+    date: new Intl.DateTimeFormat(undefined, { ...dateOptions, timeZone }),
+    time: new Intl.DateTimeFormat(undefined, { ...timeOptions, timeZone }),
+  });
+  const localClock = clockFormats(DASHBOARD_TIME_ZONE);
+  const utcClock = clockFormats("UTC");
 
   // Rust timestamps can include years outside 1..=9999, which ECMAScript
   // rejects, and every Intl formatter throws RangeError on that Invalid Date. That
   // escapes into render()'s catch, which the 5s poll then rebuilds forever, so
-  // one bad timestamp would take every route down. Both helpers stay total.
+  // one bad timestamp would take every route down. when() stays total.
   const parsed = (iso) => {
     const date = new Date(iso);
     return Number.isNaN(date.getTime()) ? null : date;
   };
 
-  const whenText = (iso) => {
-    if (!iso) return "–";
-    const date = parsed(iso);
-    if (!date) return iso;
+  const clockText = (clock, date) => {
     const parts = Object.fromEntries(
-      dateFormat
+      clock.date
         .formatToParts(date)
         .filter((part) => part.type !== "literal")
         .map((part) => [part.type, part.value]),
     );
     const timeParts = Object.fromEntries(
-      timeFormat
+      clock.time
         .formatToParts(date)
         .filter((part) => part.type !== "literal")
         .map((part) => [part.type, part.value]),
@@ -348,11 +356,16 @@ const startDashboard = () => {
     return `${parts.year}-${parts.month}-${parts.day} ${timeParts.hour}:${timeParts.minute}:${timeParts.second}`;
   };
 
+  // The text is in the browser's zone, which nothing else on the page names, beside cron schedules written in UTC: a
+  // `0 9 * * *` next to 18:00 read as a broken schedule in Seoul. So the title names the zone, and the same instant in
+  // UTC.
   const when = (iso) => {
     if (!iso) return "–";
     const date = parsed(iso);
     if (!date) return `<time class="timestamp">${esc(iso)}</time>`;
-    return `<time class="timestamp" datetime="${esc(date.toISOString())}">${esc(whenText(iso))}</time>`;
+    const title = `${DASHBOARD_TIME_ZONE} time; ${clockText(utcClock, date)} UTC`;
+    return `<time class="timestamp" datetime="${esc(date.toISOString())}" title="${esc(title)}">` +
+      `${esc(clockText(localClock, date))}</time>`;
   };
 
   const statusBadge = (status) =>
@@ -407,6 +420,10 @@ const startDashboard = () => {
   const link = (href, text, id) =>
     `<a href="${esc(url(href))}" id="${esc(id)}" data-nav>${text}</a>`;
 
+  // The current page's crumb names the page: paint() copies its title into the document's and moves focus to it after
+  // a navigation, so it carries a fixed id, and `tabindex="-1"` to take focus from script without adding a tab stop.
+  const CURRENT_CRUMB_ID = "breadcrumb-current";
+
   const breadcrumb = (href, label) => {
     const safeLabel = esc(label);
     const content = label === "PGQueue"
@@ -415,21 +432,26 @@ const startDashboard = () => {
       : safeLabel;
     return href
       ? `<li><a href="${esc(url(href))}" id="${esc(domId("breadcrumb", href))}" data-nav title="${safeLabel}">${content}</a></li>`
-      : `<li><span aria-current="page" title="${safeLabel}">${content}</span></li>`;
+      : `<li><span id="${CURRENT_CRUMB_ID}" aria-current="page" tabindex="-1" title="${safeLabel}">${content}</span></li>`;
   };
 
   const rowNavAttrs = (href, id) =>
     `class="clickable-row" id="${esc(id)}" data-row-nav="${esc(url(href))}" tabindex="0"`;
 
+  // The queue page has two pagers, so each button names the list it pages: two "Next" buttons told a screen reader
+  // nothing about which table either one moved.
+  const PAGED_LISTS = { queues: "queues", workers: "workers", jobs: "jobs", crons: "cron jobs" };
+
   const pagerMarkup = (name, first, last, hasPrevious, hasNext) => {
+    const list = PAGED_LISTS[name] ?? name;
     return `<div class="pager">
       <span class="pager-summary">Showing ${first}-${last}</span>
       <div class="pager-controls">
         <button type="button" class="outline" id="${esc(domId("pager", name, "prev"))}"
-                data-pager="${esc(name)}" data-page="-1"
+                data-pager="${esc(name)}" data-page="-1" aria-label="Previous page of ${esc(list)}"
                 ${hasPrevious ? "" : "disabled"}>Previous</button>
         <button type="button" class="outline" id="${esc(domId("pager", name, "next"))}"
-                data-pager="${esc(name)}" data-page="1"
+                data-pager="${esc(name)}" data-page="1" aria-label="Next page of ${esc(list)}"
                 ${hasNext ? "" : "disabled"}>Next</button>
       </div>
     </div>`;
@@ -446,11 +468,12 @@ const startDashboard = () => {
       </details>`
     : `<span title="Signed-in user">${esc(DASHBOARD_USER)}</span>`;
 
+  // `.app-dialog` is the one dialog component: this form and the Abort confirmation (abortDialog) share its card.
   const passwordDialog = () => AUTH_ENABLED
-    ? `<dialog class="account-dialog" id="password-dialog">
+    ? `<dialog class="app-dialog" id="password-dialog" aria-labelledby="password-dialog-title">
         <article>
           <form id="password-form">
-            <header><h2>Change password</h2></header>
+            <header><h2 id="password-dialog-title">Change password</h2></header>
             <label for="current-password">Current password</label>
             <input id="current-password" name="current_password" type="password"
                    autocomplete="current-password" required>
@@ -470,22 +493,44 @@ const startDashboard = () => {
       </dialog>`
     : "";
 
-  // `.refresh-error` is filled by setRefreshError, never by markup. The page
+  // Abort stops a running handler where it is, and a retry can only run the job again from its start, so the button
+  // asks first. Cancel comes first: showModal() focuses the first button, so a second Enter dismisses the question
+  // rather than answering it.
+  const abortDialog = (noun) => `<dialog class="app-dialog" id="abort-dialog" aria-labelledby="abort-dialog-title"
+          aria-describedby="abort-dialog-text">
+        <article>
+          <div>
+            <header><h2 id="abort-dialog-title">Abort this ${esc(noun)}?</h2></header>
+            <p id="abort-dialog-text">A queued job will not run, and a running one stops where it is. A retry starts it
+              over from the beginning.</p>
+            <footer>
+              <button type="button" class="secondary" id="abort-cancel" data-close-dialog>Cancel</button>
+              <button type="button" id="abort-confirm" data-confirm-abort>Abort</button>
+            </footer>
+          </div>
+        </article>
+      </dialog>`;
+
+  // `.refresh-error` is filled by setRefreshError, never by markup, and read out
+  // through the announcer rather than as a live region of its own. The page
   // content carries a scroll key because on a short or narrow screen it
   // scrolls as a whole (see app.css), and every poll that changed anything
-  // threw it back to the top.
-  const layout = (crumbs, body, pageClass = "") => `
+  // threw it back to the top. Each of `parts` is one element, and the content holds nothing else, so the content's
+  // children are the parts, in order.
+  const layout = (crumbs, parts, pageClass = "") => `
     <header class="app-header">
       <nav class="breadcrumbs" aria-label="Breadcrumb">
         <ol>${crumbs.join("")}</ol>
       </nav>
       <div class="nav-context" aria-label="Dashboard context">
-        <span class="refresh-error" role="status" aria-live="polite" hidden></span>
+        <span class="refresh-error" hidden></span>
         ${accountControls()}
       </div>
     </header>
     ${passwordDialog()}
-    <div class="page-content ${esc(pageClass)}" data-scroll-key="page">${body}</div>`;
+    <div class="page-content ${esc(pageClass)}" data-scroll-key="page">${PART_BREAK}${
+      parts.map((part) => part.trim()).join(PART_BREAK)
+    }${PART_BREAK}</div>`;
 
   const signalBadge = (value, tone = "") =>
     `<span class="signal${tone ? ` ${esc(tone)}` : ""}">${esc(value)}</span>`;
@@ -515,7 +560,7 @@ const startDashboard = () => {
       .join("");
     return layout(
       [breadcrumb(null, "PGQueue")],
-      `<section class="table-section queues-section">
+      [`<section class="table-section queues-section">
         <h2>Queues</h2>
         <form class="table-search search-filter" aria-label="Search queues">
           <div class="search-field">
@@ -528,7 +573,7 @@ const startDashboard = () => {
           <div class="table-scroll" data-scroll-key="queues"><table class="data-table">
             <thead><tr><th>Name</th><th>Ready since</th><th>Execution</th>
             <th>Next scheduled</th><th>Workers</th><th>Latest failure/abort</th></tr></thead>
-            <tbody>${rows || '<tr class="empty-row"><td colspan="6">No matching queues.</td></tr>'}</tbody>
+            <tbody>${rows || '<tr class="empty-row"><td colspan="6">No queues found.</td></tr>'}</tbody>
           </table></div>
           ${pagerMarkup(
             "queues",
@@ -538,7 +583,7 @@ const startDashboard = () => {
             queuesView.offset + visibleQueues.length < filteredQueues.length,
           )}
         </div>
-      </section>`,
+      </section>`],
       "home-page",
     );
   };
@@ -658,7 +703,7 @@ const startDashboard = () => {
           )}</td>
           <td class="job-name"><span title="${esc(j.name)}">${esc(j.name)}</span></td>
           ${kind === "cron" ? `<td class="mono cron-expression">${esc(j.cron_expr ?? "–")}</td>` : ""}
-          <td><button type="button" class="status status-chip ${esc(j.status)}" id="${esc(domId("status-chip", j.id))}" data-entry-kind="${esc(kind)}" data-status="${esc(j.status)}" title="Filter by ${esc(j.status)}"><span class="dot"></span>${esc(j.status)}</button></td>
+          <td><button type="button" class="status status-chip ${esc(j.status)}" id="${esc(domId("status-chip", j.id))}" data-entry-kind="${esc(kind)}" data-status="${esc(j.status)}" title="Filter by ${esc(j.status)}" aria-label="Filter by ${esc(j.status)}"><span class="dot"></span>${esc(j.status)}</button></td>
           <td class="num">${j.attempts}/${j.max_attempts}</td>
           <td>${when(j.scheduled_at)}</td>
           <td>${when(j.completed_at)}</td>
@@ -666,15 +711,19 @@ const startDashboard = () => {
       )
       .join("");
 
+    const emptyEntries = kind === "cron" ? "No cron jobs found." : "No jobs found.";
+
+    // The One-Off/Cron switch is a pair of toggle buttons rather than tabs: the tab pattern promises arrow keys between
+    // the tabs and a panel for each, which a screen reader announced for two buttons that only switch the list below.
     return layout(
       [breadcrumb("/", "PGQueue"), breadcrumb(null, `Queue ${name}`)],
-      `<section class="table-section workers-section">
+      [`<section class="table-section workers-section">
         <h2>Workers</h2>
         <div class="table-frame">
           <div class="table-scroll" data-scroll-key="workers"><table class="data-table">
             <thead><tr><th>Worker</th><th class="num">Complete</th><th class="num">Retried</th>
             <th class="num">Failed</th><th class="num">Aborted</th><th class="num">Uptime</th></tr></thead>
-            <tbody>${workerRows || '<tr class="empty-row"><td colspan="6">No results found.</td></tr>'}</tbody>
+            <tbody>${workerRows || '<tr class="empty-row"><td colspan="6">No workers found.</td></tr>'}</tbody>
           </table></div>
           ${pagerMarkup(
             "workers",
@@ -684,13 +733,13 @@ const startDashboard = () => {
             Boolean(workersView.nextCursor),
           )}
         </div>
-      </section>
-      <section class="jobs-section">
+      </section>`,
+      `<section class="jobs-section">
         <h2>Jobs</h2>
         <div class="job-toolbar">
-          <div class="segmented kind-tabs" role="tablist" aria-label="Queue entries">
-            <button type="button" role="tab" id="kind-tab-job" data-kind="job" aria-selected="${kind === "job"}">One-Off</button>
-            <button type="button" role="tab" id="kind-tab-cron" data-kind="cron" aria-selected="${kind === "cron"}">Cron</button>
+          <div class="segmented kind-tabs" role="group" aria-label="Queue entries">
+            <button type="button" id="kind-tab-job" data-kind="job" aria-pressed="${kind === "job"}">One-Off</button>
+            <button type="button" id="kind-tab-cron" data-kind="cron" aria-pressed="${kind === "cron"}">Cron</button>
           </div>
           <div class="filter-group">
             <div class="segmented" role="group" aria-label="Filter jobs by status">${tabs}</div>
@@ -708,9 +757,9 @@ const startDashboard = () => {
         </div>
         <div class="table-frame">
           <div class="table-scroll" data-scroll-key="${entryKey}"><table class="data-table">
-            <thead><tr><th>ID</th><th>Name</th>${kind === "cron" ? "<th>Schedule</th>" : ""}<th>Status</th><th class="num">Attempts</th>
-            <th>${kind === "cron" ? "Next run" : "Scheduled"}</th><th>Completed</th></tr></thead>
-            <tbody>${rows || `<tr class="empty-row"><td colspan="${kind === "cron" ? 7 : 6}">No jobs found.</td></tr>`}</tbody>
+            <thead><tr><th>ID</th><th>Name</th>${kind === "cron" ? "<th>Schedule (UTC)</th>" : ""}<th>Status</th><th class="num">Attempts</th>
+            <th>Scheduled</th><th>Completed</th></tr></thead>
+            <tbody>${rows || `<tr class="empty-row"><td colspan="${kind === "cron" ? 7 : 6}">${emptyEntries}</td></tr>`}</tbody>
           </table></div>
           ${pagerMarkup(
             entryKey,
@@ -720,7 +769,7 @@ const startDashboard = () => {
             Boolean(entryView.nextCursor),
           )}
         </div>
-      </section>`,
+      </section>`],
       "queue-page",
     );
   };
@@ -734,8 +783,8 @@ const startDashboard = () => {
         breadcrumb(`/queues/${encodeURIComponent(name)}`, `Queue ${name}`),
         breadcrumb(null, `Worker ${worker.id}`),
       ],
-      `<div class="detail-heading"><h2>Worker ${esc(worker.id)}</h2></div>
-      <div class="table-frame"><div class="table-scroll" data-scroll-key="worker-details"><table class="data-table">
+      [`<div class="detail-heading"><h2>Worker ${esc(worker.id)}</h2></div>`,
+      `<div class="table-frame"><div class="table-scroll" data-scroll-key="worker-details"><table class="data-table">
         ${detailRow("ID", `<span class="mono">${esc(worker.id)}</span>`)}
         ${detailRow("Queue", esc(worker.queue))}
         ${detailRow("Complete", statCell(worker, "complete"))}
@@ -747,7 +796,7 @@ const startDashboard = () => {
         ${detailRow("Last heartbeat", when(worker.heartbeat_at))}
         ${detailRow("Expires", when(worker.expires_at))}
         ${detailRow("Metadata", jsonBlock(worker.metadata, worker.metadata_truncated, "worker-metadata"))}
-      </table></div></div>`,
+      </table></div></div>`],
       "detail-page",
     );
   };
@@ -767,22 +816,22 @@ const startDashboard = () => {
         breadcrumb(`/queues/${encodeURIComponent(name)}`, `Queue ${name}`),
         breadcrumb(null, `${detailLabel} ${job.id}`),
       ],
-      `<div class="detail-heading">
+      [`<div class="detail-heading">
         <h2>${detailLabel} ${esc(job.id)}</h2>
         <div class="actions">
           <button type="button" id="action-retry" data-action="retry" ${retryable ? "" : "disabled"}>Retry</button>
           <button type="button" class="secondary" id="action-abort" data-action="abort" ${abortable ? "" : "disabled"}>Abort</button>
         </div>
-      </div>
-      <div class="action-message" role="status" aria-live="polite" hidden>
+      </div>`,
+      `<div class="action-message" hidden>
         <span class="action-message-text"></span>
         <button type="button" class="secondary" id="action-message-dismiss"
                 data-dismiss-action-message aria-label="Dismiss message">Dismiss</button>
-      </div>
-      <div class="table-frame"><div class="table-scroll" data-scroll-key="job-details"><table class="data-table">
+      </div>`,
+      `<div class="table-frame"><div class="table-scroll" data-scroll-key="job-details"><table class="data-table">
         ${detailRow("ID", `<span class="mono">${esc(job.id)}</span>`)}
         ${detailRow("Name", esc(job.name))}
-        ${isCron ? detailRow("Schedule", `<span class="mono cron-expression">${esc(job.cron_expr ?? "–")}</span>`) : ""}
+        ${isCron ? detailRow("Schedule (UTC)", `<span class="mono cron-expression">${esc(job.cron_expr ?? "–")}</span>`) : ""}
         ${detailRow("Status", statusBadge(job.status))}
         ${detailRow("Attempts", `${job.attempts}/${job.max_attempts}`)}
         ${detailRow("Priority", job.priority)}
@@ -799,6 +848,7 @@ const startDashboard = () => {
         ${detailRow("Result", jsonBlock(job.result, job.result_truncated, "job-result"))}
         ${detailRow("Metadata", jsonBlock(job.meta, job.meta_truncated, "job-meta"))}
       </table></div></div>`,
+      abortDialog(isCron ? "cron job" : "job")],
       "detail-page",
     );
   };
@@ -806,7 +856,7 @@ const startDashboard = () => {
   const errorView = (error) =>
     layout(
       [breadcrumb("/", "PGQueue"), breadcrumb(null, "Error")],
-      `<article class="error-banner">${esc(error.message || error)}</article>`,
+      [`<article class="error-banner">${esc(error.message || error)}</article>`],
     );
 
   const route = () => {
@@ -826,7 +876,23 @@ const startDashboard = () => {
   let rendering = false;
   let renderRequested = false;
   let lastMarkup = null;
+  // The header part of `lastMarkup` (see splitHeader): a repaint that brings the same one keeps the live header.
+  let lastHeaderMarkup = null;
+  // The rest of `lastMarkup`, split at PART_BREAK (see splitParts): a repaint that brings the same shell keeps the
+  // page's content, and in it each part it brings again (see paint).
+  let lastShellMarkup = null;
+  let lastPartMarkups = [];
+  // The parts on screen that a handler changed ahead of the paint that will draw them (see markStale).
+  const staleParts = new Set();
   let renderedPath = null;
+  // The path whose markup is on screen, the error page's included, which is what tells paint() a navigation from a
+  // repaint of the same page.
+  let paintedPath = null;
+  // Set from a navigation's start until its page is painted (see markNavigating), with the action buttons it disabled.
+  let navigationPending = false;
+  let navigationDisabled = [];
+  // The Abort button whose confirmation is open: a confirmed abort posts through it, a cancelled one hands focus back.
+  let abortOpener = null;
   // Module-level, not on the button: a repaint replaces the button mid-request.
   let actionInFlight = false;
   // Whether an IME composition is open in one of the search inputs. A repaint
@@ -842,7 +908,7 @@ const startDashboard = () => {
     const selection = document.getSelection?.();
     return Boolean(selection && !selection.isCollapsed && app.contains?.(selection.anchorNode));
   };
-  const repaintDeferred = () => composing || app.querySelector(".account-dialog[open]") || selectingText();
+  const repaintDeferred = () => composing || app.querySelector(".app-dialog[open]") || selectingText();
   // An action on the page gives the selection up instead. The repaint it asks for replaces the selected text anyway,
   // and a click on a button leaves a selection standing, so a filter, a page turn or an applied Abort otherwise waited
   // for the operator to click on some text and a poll to come round, while its state had already moved: a second
@@ -869,12 +935,53 @@ const startDashboard = () => {
     const above = search.top - port.top;
     list.classList.toggle("above", list.offsetHeight > below && above > below);
   };
+  // The app header layout() opens every page with, and the rest of the page after it. Nothing inside the header is a
+  // <header> of its own, so the first closing tag is the header's.
+  const splitHeader = (markup) => {
+    const end = markup.indexOf("</header>") + "</header>".length;
+    return end < "</header>".length ? ["", markup] : [markup.slice(0, end), markup.slice(end)];
+  };
+  // The page after its header, split into the parts of its content (see layout) and the shell around them: the dialog
+  // before the content, and the content's own tags.
+  const splitParts = (markup) => {
+    const pieces = markup.split(PART_BREAK);
+    return pieces.length < 3 ? [markup, []] : [pieces[0] + pieces.at(-1), pieces.slice(1, -1)];
+  };
+  const partOf = (element) => element?.closest(".page-content > *");
+  // A table marked busy, a filter pressed, the buttons an action turned off: none of it is in the markup, so the paint
+  // that draws the part it sits in rebuilds that part even when its markup comes back unchanged (see paint).
+  const markStale = (element) => {
+    const part = partOf(element);
+    if (part) staleParts.add(part);
+  };
   // Puts `nextMarkup`, a page for `issuedPath`, on screen unless it is there already, and carries across what the
   // markup does not hold. The error page comes through here too. Written straight into #app, it was rebuilt by every
   // poll that got the same answer — every poll, on a purged job's or a stopped worker's page left open — and each
   // rebuild closed the account menu, dropped focus and wiped an account message.
   const paint = (nextMarkup, issuedPath) => {
     if (nextMarkup === lastMarkup) return;
+    const [headerMarkup, pageMarkup] = splitHeader(nextMarkup);
+    const [shellMarkup, partMarkups] = splitParts(pageMarkup);
+    // A header the paint would rebuild unchanged is kept as it is, with what it holds that its markup does not: the
+    // account menu open, an account message, a refresh notice, and focus. Rebuilt, it took focus away from its crumb
+    // or menu and gave it back on every poll that changed the page below, and a screen reader read that control out
+    // again each time. Compared with the header last painted, not the live one, which carries that state.
+    const keptHeader = headerMarkup === lastHeaderMarkup ? app.querySelector(".app-header") : null;
+    // Not the first page this tab shows: the browser itself reports a page load.
+    const navigated = paintedPath != null && issuedPath !== paintedPath;
+    paintedPath = issuedPath;
+    // Below a kept header the same goes for the page's content, part by part: a part whose markup is the one last
+    // painted, and that no handler marked since (see markStale), is kept. Rebuilt with the rest, the status filter or
+    // job row that held focus lost it and got it back, read out again, on every poll that changed only the workers
+    // table, which a live worker's uptime does every time. A page that markNavigating() marked busy is rebuilt whole.
+    const content = app.querySelector(".page-content");
+    const keptContent = keptHeader
+      && !navigationPending
+      && shellMarkup === lastShellMarkup
+      && partMarkups.length === lastPartMarkups.length
+      && content?.children.length === partMarkups.length
+      ? content
+      : null;
     const active = document.activeElement;
     const focusId = active?.id;
     // A scroll box has no id (see domId), so it is found again by its key.
@@ -895,26 +1002,49 @@ const startDashboard = () => {
     // None of this is in the generated markup — the browser sets <details
     // open> itself and both message nodes are written imperatively — so a
     // poll would otherwise wipe them. The nodes are moved, not copied, so
-    // re-inserting announces nothing new to the live region. Their lifetime
-    // is owned elsewhere (setAccountMessage's timer, navigate, popstate),
-    // since this restore alone would carry them forever.
+    // re-inserting the account message announces nothing new to its live
+    // region. Their lifetime is owned elsewhere (setAccountMessage's timer,
+    // navigate, popstate), since this restore alone would carry them forever.
     const accountMenuOpen = app.querySelector(".account-menu")?.hasAttribute("open");
     const accountMessage = app.querySelector(".account-message");
     const actionMessage = app.querySelector(".action-message:not([hidden])");
-    app.innerHTML = nextMarkup;
+    if (keptContent) {
+      partMarkups.forEach((markup, index) => {
+        const part = keptContent.children[index];
+        if (markup !== lastPartMarkups[index] || staleParts.has(part)) part.outerHTML = markup;
+      });
+    } else if (keptHeader) {
+      while (keptHeader.nextSibling) keptHeader.nextSibling.remove();
+      keptHeader.insertAdjacentHTML("afterend", pageMarkup);
+    } else {
+      app.innerHTML = nextMarkup;
+      if (accountMenuOpen) app.querySelector(".account-menu")?.setAttribute("open", "");
+      if (accountMessage?.textContent) {
+        app.querySelector(".account-message")?.replaceWith(accountMessage);
+      }
+    }
     lastMarkup = nextMarkup;
-    if (accountMenuOpen) app.querySelector(".account-menu")?.setAttribute("open", "");
-    if (accountMessage?.textContent) {
-      app.querySelector(".account-message")?.replaceWith(accountMessage);
-    }
-    if (actionMessage) {
-      app.querySelector(".action-message")?.replaceWith(actionMessage);
-    }
+    lastHeaderMarkup = headerMarkup;
+    lastShellMarkup = shellMarkup;
+    lastPartMarkups = partMarkups;
+    staleParts.clear();
+    // The page markNavigating() marked busy is gone, and its disabled buttons with it.
+    navigationPending = false;
+    navigationDisabled = [];
+    // A tab's title, and so its history entry, names the page: every job opened with Cmd-click was a tab called
+    // "PGQueue". The current crumb already holds the name.
+    const pageName = app.querySelector(`#${CURRENT_CRUMB_ID}`)?.getAttribute("title") || "PGQueue";
+    document.title = pageName === "PGQueue" ? pageName : `${pageName} | PGQueue`;
+    // A kept part holds the message already.
+    const messageSlot = app.querySelector(".action-message");
+    if (actionMessage && messageSlot !== actionMessage) messageSlot?.replaceWith(actionMessage);
     // `disabled` is not in the markup for a retryable job, so a repaint
     // mid-request would draw live-looking buttons actionInFlight refuses.
     if (actionInFlight) {
       app.querySelectorAll("button[data-action]").forEach((button) => {
+        if (button.disabled) return;
         button.disabled = true;
+        markStale(button);
       });
     }
     app.querySelectorAll("[data-scroll-key]").forEach((element) => {
@@ -930,14 +1060,27 @@ const startDashboard = () => {
     }
     // focus() on a disabled element is a no-op, so finding it is not enough
     // — focus would fall to <body>. A pager reaches this by working normally
-    // (Next on the last page), and its sibling takes the paging over.
+    // (Next on the last page), and its sibling takes the paging over. An
+    // action reaches it once applied, or once the job moves on under a poll,
+    // and hands focus to the page's crumb, which a repaint keeps (see
+    // `keptHeader`): never to the other action, where after an applied Abort
+    // the next Enter would run on Retry the job just aborted.
     if (nextActive?.disabled) {
-      nextActive = nextActive.closest(".pager-controls")
-        ?.querySelector("button:not(:disabled)") ?? null;
+      nextActive = nextActive.matches("[data-action]")
+        ? app.querySelector(`#${CURRENT_CRUMB_ID}`)
+        : nextActive.closest(".pager-controls")?.querySelector("button:not(:disabled)") ?? null;
     }
-    if (nextActive) {
+    // A navigation leaves nothing of the old focus behind, and focus fell to <body>, where a screen reader said nothing
+    // of the page that replaced the last one. The current crumb names it instead.
+    if (!nextActive && navigated) nextActive = app.querySelector(`#${CURRENT_CRUMB_ID}`);
+    // Focus the kept header still holds is left alone: focusing it again is what a screen reader reads out.
+    const moveFocus = nextActive != null && nextActive !== document.activeElement;
+    // Focus moving onto the crumb reads its name out; otherwise the announcer does.
+    if (navigated && !(moveFocus && nextActive.id === CURRENT_CRUMB_ID)) announce(pageName);
+    if (moveFocus) {
       nextActive.focus({ preventScroll: true });
-      if (selectionStart != null && selectionEnd != null) {
+      // Only onto the input the offsets came from: a navigation can hand focus from a search box to the crumb.
+      if (selectionStart != null && selectionEnd != null && nextActive.id === focusId) {
         if (nextActive.value === selectionValue) {
           nextActive.setSelectionRange(selectionStart, selectionEnd);
         } else {
@@ -980,6 +1123,9 @@ const startDashboard = () => {
         renderRequested = true;
         return;
       }
+      // A navigation always repaints, even onto the markup already on screen, as when Back returns before the next
+      // page painted: only a fresh paint takes away the busy page markNavigating() left.
+      if (navigationPending) lastMarkup = null;
       paint(nextMarkup, issuedPath);
       // A repaint brings an empty notice of its own; unchanged markup keeps the one a failed refresh filled.
       clearRefreshError();
@@ -995,8 +1141,10 @@ const startDashboard = () => {
       // a search box mid-word — over a blip. A first load, a navigation and a final answer still get the error page.
       if (renderedPath === issuedPath && retryableFailure(error)) {
         setRefreshError(error);
+        settleNavigation();
         return;
       }
+      if (navigationPending) lastMarkup = null;
       paint(errorView(error), issuedPath);
       // The error page stands in for no page: a later failure replaces it, rather than counting as a refresh of it.
       renderedPath = null;
@@ -1026,11 +1174,55 @@ const startDashboard = () => {
   // with nobody in its search box, and an action message would be carried by
   // render() into the next job page's slot.
   const navigate = (url) => {
+    // The page being left stays on screen until the next one paints, so the second click of a double-click lands on
+    // the same link or row, and pushed a second history entry for the page the first was already opening.
+    if (url === location.pathname) return;
     closeNameSuggestions();
     clearActionMessage();
     abandonPageReads();
+    markNavigating();
     history.pushState(null, "", url);
     void render();
+  };
+
+  // The page being left stays on screen until the next one's read lands (see `pageReads`), and its Retry and Abort
+  // already refuse to act meanwhile, since they act only on the page rendered. Nothing said so: a click on a row did
+  // nothing visible for as long as the server took, and a click on Abort was dropped without a word. So the page is
+  // marked busy, which app.css dims after a beat, and its actions are disabled. The paint that lands replaces all of it
+  // (see render); settleNavigation() undoes it for a navigation that ends on the page it left without repainting it.
+  const markNavigating = () => {
+    navigationPending = true;
+    app.querySelector(".page-content")?.setAttribute("aria-busy", "true");
+    for (const button of app.querySelectorAll("button[data-action]")) {
+      if (button.disabled) continue;
+      button.disabled = true;
+      navigationDisabled.push(button);
+    }
+    // The question was about a job on the page being left.
+    app.querySelector("#abort-dialog[open]")?.close();
+  };
+
+  const settleNavigation = () => {
+    if (!navigationPending) return;
+    navigationPending = false;
+    app.querySelector(".page-content")?.removeAttribute("aria-busy");
+    // An action posted meanwhile keeps them disabled, as its own repaint would (see paint).
+    if (!actionInFlight) {
+      for (const button of navigationDisabled) button.disabled = false;
+    }
+    navigationDisabled = [];
+  };
+
+  // A filter, a kind or a page turn shows only once its listing's read lands, and its control looked untouched until
+  // then: on a slow listing a second, patient click on a status undid the first before either was seen. So the
+  // control shows its new state at once, and the table it changes is marked busy, which app.css dims after a beat; the
+  // paint that lands replaces both. That paint is forced, and rebuilds the part of the page they sit in, or a second
+  // click that brings the listing back to the state on screen would match `lastMarkup`, or that part's last markup, be
+  // skipped, and leave the table busy.
+  const markListingPending = (frame) => {
+    frame?.setAttribute("aria-busy", "true");
+    markStale(frame);
+    lastMarkup = null;
   };
 
   const resetTableScroll = (name) => {
@@ -1063,6 +1255,7 @@ const startDashboard = () => {
     view.suggestionsOpen = false;
     resetCursor(view);
     resetTableScroll(key);
+    markListingPending(app.querySelector(".jobs-section .table-frame"));
     // The clicked option's list is gone by the next paint, so focus needs an id
     // that still exists for render() to restore it to.
     suggestionCombobox()?.focus();
@@ -1079,13 +1272,15 @@ const startDashboard = () => {
   // paint marks it, and Enter commits from it.
   const suggestionOptions = () => app.querySelectorAll(".name-suggestions [role=option]");
 
-  // lastMarkup goes with the list: the DOM no longer matches what render() last
-  // painted, so identical next markup would compare equal and be skipped. Only
+  // lastMarkup goes with the list, and the part it was in is marked stale: the DOM
+  // no longer matches what render() last painted, so identical next markup would
+  // compare equal and be skipped, or that part kept. Only
   // when something was removed — this runs on every click, and every move of
   // focus, outside the search.
   const removeSuggestionList = () => {
     const list = app.querySelector(".name-suggestions");
     if (!list) return;
+    markStale(list);
     list.remove();
     const input = suggestionCombobox();
     if (input) {
@@ -1152,12 +1347,25 @@ const startDashboard = () => {
     message.querySelector(".action-message-text").textContent = "";
   };
 
+  // Reads `text` out through the announcer (see index.html). Emptied first and filled a beat later, because a region
+  // set to the words it already holds is not read again, and the same refusal clicked twice should be heard twice.
+  let announcementTimer;
+  const announce = (text) => {
+    if (!announcer) return;
+    clearTimeout(announcementTimer);
+    announcer.textContent = "";
+    announcementTimer = setTimeout(() => {
+      announcer.textContent = text;
+    }, 100);
+  };
+
   const setActionMessage = (text, isError) => {
     const message = app.querySelector(".action-message");
     if (!message) return;
     message.classList.toggle("error", isError);
     message.querySelector(".action-message-text").textContent = text;
     message.hidden = false;
+    announce(text);
   };
 
   // The header notice render() fills instead of painting errorView over the page, and empties once a refresh succeeds.
@@ -1169,6 +1377,7 @@ const startDashboard = () => {
     if (notice.textContent !== text) {
       notice.textContent = text;
       notice.title = text;
+      announce(text);
     }
     notice.hidden = false;
   };
@@ -1220,6 +1429,113 @@ const startDashboard = () => {
     }
   };
 
+  // Moves focus to the page's crumb once an action has reported, unless the operator has moved on: the action disables
+  // its own button for the post, and focus fell from there to <body>, leaving a keyboard at the top of the page. The
+  // outcome itself is read out by the announcer (see setActionMessage). Not to the message's Dismiss: a repaint
+  // rebuilds the page around the message, which took focus from Dismiss and gave it back, read out again, on every
+  // poll of a running job; the crumb is in the header a repaint keeps.
+  const focusAfterAction = (action) => {
+    const active = document.activeElement;
+    if (active && active !== document.body && active.id !== action.id) return;
+    app.querySelector(`#${CURRENT_CRUMB_ID}`)?.focus({ preventScroll: true });
+  };
+
+  // Posts the Retry or Abort `action` names for the job on screen, and reports the outcome. A click on Retry comes
+  // here directly, and one on Abort once its confirmation is answered, past the same guards either way.
+  const runAction = async (action) => {
+    // actionInFlight, not action.disabled alone: `disabled` lives on the node
+    // and is not in the markup, so a repaint during the POST installs a fresh
+    // enabled button. Running jobs repaint on every heartbeat, so this window
+    // is normal.
+    if (action.disabled || actionInFlight) return;
+    // Navigation changes the URL before its response replaces the previous job's buttons, and Back can change it
+    // under an open confirmation too.
+    if (location.pathname !== renderedPath) return;
+    const { queue, id } = route();
+    if (!queue || !id) return;
+    // Now, not before the repaint below: the post is awaited, and a selection made meanwhile is a newer one.
+    dropSelection();
+    clearActionMessage();
+    actionInFlight = true;
+    action.disabled = true;
+    let navigated = false;
+    let applied = false;
+    // Every message below describes *this* job, and jobView is the only view
+    // with a slot to paint one into, so a report must not land after leaving.
+    const issuedPath = location.pathname;
+    const stillHere = () => location.pathname === issuedPath;
+    try {
+      const result = await post(
+        `/queues/${encodeURIComponent(queue)}/jobs/${id}/${action.dataset.action}`,
+      );
+      // stillHere() for the reason every message below carries it: this is a
+      // report about the job the operator was looking at, and one that lands
+      // after they have left would throw away wherever they went for a job
+      // page they never asked for. Falling through instead treats the retry
+      // as applied, which repaints whatever page they are on now.
+      if (action.dataset.action === "retry" && result.job_id && stillHere()) {
+        navigated = true;
+        navigate(`${ROOT}/queues/${encodeURIComponent(queue)}/jobs/${result.job_id}`);
+        return;
+      }
+      // `false` is the server declining, not failing: the retry statement
+      // guards on `retried_at IS NULL` and abort only reaches a live job. The
+      // page it was clicked from is up to 5s stale, so say which it was. A
+      // retry also declines while a live job holds the same dedupe key — the
+      // one cause that leaves this page exactly as it was, so leaving it out
+      // blamed a retry or a status change the operator could see had not
+      // happened, on every click.
+      if (result.retried === false) {
+        if (stillHere()) setActionMessage(
+          "This job was not retried: it has already been retried, its status changed, or a live job holds its " +
+            "dedupe key.",
+          true,
+        );
+      } else if (result.aborted === false) {
+        if (stillHere()) setActionMessage(
+          "This job was not aborted: it had already finished or been aborted.",
+          true,
+        );
+      } else {
+        // Drop the cache: the repaint below reads an API that may not have
+        // caught up, and identical markup is skipped — which would leave the
+        // button this handler disabled dead until some other field changed.
+        applied = true;
+        lastMarkup = null;
+        markStale(action);
+        // An applied abort otherwise changed one status badge, and nothing was read out at all.
+        if (action.dataset.action === "abort" && stillHere()) setActionMessage("Abort requested.", false);
+      }
+      void render();
+    } catch (error) {
+      // Inline, not errorView: replacing #app destroys the job detail, and the
+      // next poll wipes the error before it can be read.
+      if (stillHere()) setActionMessage(error.message || String(error), true);
+    } finally {
+      // Re-armed only on endings that leave the job as the operator found it.
+      // navigate() merely *starts* the repaint, so this node is still on screen
+      // while route() already answers with the new job; an enabled Retry here
+      // posts against the job just created. Applied aborts are drawn disabled.
+      actionInFlight = false;
+      // A navigation started meanwhile owns the buttons of the page it is leaving: the button stays disabled with the
+      // rest, and settleNavigation() re-enables it if that page comes back.
+      if (!navigated && !applied) {
+        if (navigationPending) navigationDisabled.push(action);
+        else action.disabled = false;
+      }
+      // A repaint during the POST replaced this node, so the line above went to
+      // a detached button while its successor stays force-disabled — or kept
+      // it, and disabled the other button beside it. That state is not in
+      // lastMarkup, so force a paint or those buttons stay dead. An applied
+      // action forced its own above.
+      if (!navigated && !applied && (!action.isConnected || staleParts.has(partOf(action)))) {
+        lastMarkup = null;
+        void render();
+      }
+      if (!navigated && stillHere()) focusAfterAction(action);
+    }
+  };
+
   app.addEventListener("click", async (event) => {
     const accountAction = event.target.closest("button[data-account-action]");
     if (accountAction) {
@@ -1249,7 +1565,11 @@ const startDashboard = () => {
     const dismiss = event.target.closest("button[data-dismiss-action-message]");
     if (dismiss) {
       event.preventDefault();
+      const hadFocus = document.activeElement === dismiss;
       clearActionMessage();
+      // Hiding the button drops its focus to <body>. The page's crumb takes it rather than Retry, where after an
+      // applied Abort the next Enter would run again the job just aborted.
+      if (hadFocus) app.querySelector(`#${CURRENT_CRUMB_ID}`)?.focus({ preventScroll: true });
       return;
     }
     const nav = event.target.closest("a[data-nav]");
@@ -1280,6 +1600,11 @@ const startDashboard = () => {
       }
       resetCursor(entryView);
       resetTableScroll(entryKey);
+      // A status chip in a row toggles the same filter, so the filter's own button shows it either way.
+      app
+        .querySelector(`#${domId("status-filter", tab.dataset.entryKind, status)}`)
+        ?.setAttribute("aria-pressed", String(entryView.statuses.has(status)));
+      markListingPending(app.querySelector(".jobs-section .table-frame"));
       // Emptied rather than re-asked: the names answered the old filter, and the
       // arrows fall back to this array whenever no list is on screen. Re-asking
       // would pop the list open unbidden. The next keystroke asks again.
@@ -1292,7 +1617,13 @@ const startDashboard = () => {
     const kindTab = event.target.closest("button[data-kind]");
     if (kindTab) {
       event.preventDefault();
-      entryKind = kindTab.dataset.kind;
+      if (kindTab.dataset.kind !== entryKind) {
+        entryKind = kindTab.dataset.kind;
+        for (const kind of Object.keys(entries)) {
+          app.querySelector(`#kind-tab-${kind}`)?.setAttribute("aria-pressed", String(kind === entryKind));
+        }
+        markListingPending(app.querySelector(".jobs-section .table-frame"));
+      }
       dropSelection();
       void render();
       return;
@@ -1312,6 +1643,10 @@ const startDashboard = () => {
     const pagerButton = event.target.closest("button[data-page]");
     if (pagerButton && !pagerButton.disabled) {
       event.preventDefault();
+      // Off until the page it asked for paints, which replaces it: a second Enter would page twice. aria-disabled, not
+      // `disabled`, which took focus from the button and left the paint no id to hand it back to, so a keyboard paging
+      // through a listing landed on <body> after every page.
+      if (pagerButton.getAttribute("aria-disabled") === "true") return;
       const name = pagerButton.dataset.pager;
       const direction = Number(pagerButton.dataset.page);
       if (name === "queues") {
@@ -1336,90 +1671,41 @@ const startDashboard = () => {
         }
       }
       resetTableScroll(pagerButton.dataset.pager);
+      pagerButton.setAttribute("aria-disabled", "true");
+      markListingPending(pagerButton.closest(".table-frame"));
       dropSelection();
       void render();
       return;
     }
+    // Before the action branch: the confirmation's own buttons carry no `data-action`.
+    const confirmAbort = event.target.closest("button[data-confirm-abort]");
+    if (confirmAbort) {
+      event.preventDefault();
+      // Taken before the dialog closes, so its `close` handler hands focus back to nothing: the post below disables the
+      // opener, and its outcome decides where focus goes.
+      const opener = abortOpener;
+      abortOpener = null;
+      app.querySelector("#abort-dialog")?.close();
+      if (opener) await runAction(opener);
+      return;
+    }
+    const closeDialog = event.target.closest("button[data-close-dialog]");
+    if (closeDialog) {
+      event.preventDefault();
+      closeDialog.closest("dialog")?.close();
+      return;
+    }
     const action = event.target.closest("button[data-action]");
-    // actionInFlight, not action.disabled: `disabled` lives on the node and is
-    // not in the markup, so a repaint during the POST installs a fresh enabled
-    // button. Running jobs repaint on every heartbeat, so this window is normal.
     if (action && !action.disabled && !actionInFlight) {
       event.preventDefault();
       // Navigation changes the URL before its response replaces the previous job's buttons.
       if (location.pathname !== renderedPath) return;
-      const { queue, id } = route();
-      if (!queue || !id) return;
-      // Now, not before the repaint below: the post is awaited, and a selection made meanwhile is a newer one.
-      dropSelection();
-      clearActionMessage();
-      actionInFlight = true;
-      action.disabled = true;
-      let navigated = false;
-      let applied = false;
-      // Every message below describes *this* job, and jobView is the only view
-      // with a slot to paint one into, so a report must not land after leaving.
-      const issuedPath = location.pathname;
-      const stillHere = () => location.pathname === issuedPath;
-      try {
-        const result = await post(
-          `/queues/${encodeURIComponent(queue)}/jobs/${id}/${action.dataset.action}`,
-        );
-        // stillHere() for the reason every message below carries it: this is a
-        // report about the job the operator was looking at, and one that lands
-        // after they have left would throw away wherever they went for a job
-        // page they never asked for. Falling through instead treats the retry
-        // as applied, which repaints whatever page they are on now.
-        if (action.dataset.action === "retry" && result.job_id && stillHere()) {
-          navigated = true;
-          navigate(`${ROOT}/queues/${encodeURIComponent(queue)}/jobs/${result.job_id}`);
-          return;
-        }
-        // `false` is the server declining, not failing: the retry statement
-        // guards on `retried_at IS NULL` and abort only reaches a live job. The
-        // page it was clicked from is up to 5s stale, so say which it was. A
-        // retry also declines while a live job holds the same dedupe key — the
-        // one cause that leaves this page exactly as it was, so leaving it out
-        // blamed a retry or a status change the operator could see had not
-        // happened, on every click.
-        if (result.retried === false) {
-          if (stillHere()) setActionMessage(
-            "This job was not retried: it has already been retried, its status changed, or a live job holds its " +
-              "dedupe key.",
-            true,
-          );
-        } else if (result.aborted === false) {
-          if (stillHere()) setActionMessage(
-            "This job was not aborted: it had already finished or been aborted.",
-            true,
-          );
-        } else {
-          // Drop the cache: the repaint below reads an API that may not have
-          // caught up, and identical markup is skipped — which would leave the
-          // button this handler disabled dead until some other field changed.
-          applied = true;
-          lastMarkup = null;
-        }
-        void render();
-      } catch (error) {
-        // Inline, not errorView: replacing #app destroys the job detail, and the
-        // next poll wipes the error before it can be read.
-        if (stillHere()) setActionMessage(error.message || String(error), true);
-      } finally {
-        // Re-armed only on endings that leave the job as the operator found it.
-        // navigate() merely *starts* the repaint, so this node is still on screen
-        // while route() already answers with the new job; an enabled Retry here
-        // posts against the job just created. Applied aborts are drawn disabled.
-        actionInFlight = false;
-        if (!navigated && !applied) action.disabled = false;
-        // A repaint during the POST replaced this node, so the line above went to
-        // a detached button while its successor stays force-disabled. That state
-        // is not in lastMarkup, so force a paint or both buttons stay dead.
-        if (!navigated && !action.isConnected) {
-          lastMarkup = null;
-          void render();
-        }
+      if (action.dataset.action === "abort") {
+        abortOpener = action;
+        app.querySelector("#abort-dialog")?.showModal();
+        return;
       }
+      await runAction(action);
     }
   });
 
@@ -1539,6 +1825,7 @@ const startDashboard = () => {
     const kind = { "job-name-filter": "job", "cron-name-filter": "cron" }[event.target.id];
     if (kind) {
       const { view, key } = entries[kind];
+      const committed = view.name;
       view.query = event.target.value;
       if (view.query !== view.name) view.name = "";
       // Invalidate the request and the painted options immediately. Keyboard
@@ -1549,8 +1836,12 @@ const startDashboard = () => {
       view.suggestionIndex = -1;
       view.suggestionsOpen = false;
       removeSuggestionList();
-      resetCursor(view);
-      resetTableScroll(key);
+      // Only a keystroke that drops the committed filter changes the listing. Typing to see suggestions turned the next
+      // poll of page 2 into page 1, with the way back to it gone.
+      if (view.name !== committed) {
+        resetCursor(view);
+        resetTableScroll(key);
+      }
       suggestionTimer = setTimeout(() => loadJobNameSuggestions(view, kind), 250);
     }
   });
@@ -1578,7 +1869,14 @@ const startDashboard = () => {
   app.addEventListener(
     "close",
     (event) => {
-      if (event.target.matches?.(".account-dialog") && renderRequested) {
+      if (!event.target.matches?.(".app-dialog")) return;
+      // Focus goes back to what opened the dialog, or it fell to <body>. The password form's own button went with the
+      // account menu, closed as the form opened, so the menu's summary takes it; a confirmed abort has already taken
+      // its opener (see the click handler).
+      const opener = event.target.id === "password-dialog" ? app.querySelector("#account-summary") : abortOpener;
+      abortOpener = null;
+      if (opener?.isConnected && !opener.disabled) opener.focus();
+      if (renderRequested) {
         renderRequested = false;
         void render();
       }
@@ -1613,6 +1911,7 @@ const startDashboard = () => {
     closeNameSuggestions();
     clearActionMessage();
     abandonPageReads();
+    markNavigating();
     void render();
   });
   setInterval(() => {

@@ -22,7 +22,7 @@ Add PGQueue to an application with:
 ```toml
 [dependencies]
 anyhow = "1"
-pgqueue = "0.2"
+pgqueue = "0.3"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -217,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
 Enable the `dashboard` feature to use the built-in web dashboard:
 
 ```toml
-pgqueue = { version = "0.2", features = ["dashboard"] }
+pgqueue = { version = "0.3", features = ["dashboard"] }
 ```
 
 The dashboard shows your queues, workers, and jobs. Run it as a standalone server behind a reverse proxy:
@@ -256,3 +256,20 @@ per client, and reads each client's address from the entries those proxies appen
 connection's address instead, which behind a proxy is the proxy's for every request, so a flood of wrong passwords from
 anywhere locks everyone out, the operator included. Keep `0` for a dashboard that clients can connect to directly,
 since they can write anything into the header.
+
+## Upgrading
+
+Upgrade every process that shares a database at the same time. When a release adds migrations, the first of its
+processes to connect applies them, and from then on processes of older releases refuse to connect to that database, so
+roll back by restoring the database rather than by redeploying the older release. When the application connects as a
+more restricted role, apply migrations as the owner of the `pgqueue` schema with the `pgqueue-migrate` command of the
+same release, since the command applies every migration it carries:
+
+```sh
+cargo install pgqueue --version =0.3.0 --locked
+DATABASE_URL=postgres://schema_owner@localhost/app pgqueue-migrate
+```
+
+0.3 narrows what PostgreSQL's built-in `pg_monitor` role can read: still queue depth, worker leases and cron schedules,
+but no longer job payloads, results, errors, metadata or dedupe keys. It also repairs, on connect, a database that 0.1
+migrated, which 0.2 refused to connect to.

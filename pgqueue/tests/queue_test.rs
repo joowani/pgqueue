@@ -1115,16 +1115,266 @@ async fn test_connect_rejects_a_modified_migration(pool: PgPool) {
     assert!(matches!(error, Error::Migration(sqlx::migrate::MigrateError::VersionMismatch(1))), "{error}");
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn test_connect_releases_the_migration_lock_after_applying_a_missing_history_entry_fails(pool: PgPool) {
-    let deleted = sqlx::query(
-        "DELETE FROM pgqueue.migrations
-         WHERE version = (SELECT max(version) FROM pgqueue.migrations)",
-    )
+/// The SHA-384 of every migration a published release carried. The migrator refuses a database whose history
+/// records a different checksum for a version, so editing a released migration in place, even one of its comments,
+/// leaves every database that release migrated unable to connect: 0.2.0 did that to migration 1, and only the repair
+/// in `test_connect_repairs_a_schema_migrated_by_v0_1` undoes it. Add a migration's checksum here when a release first
+/// ships it, and change a released schema only through a new migration.
+const RELEASED_MIGRATION_CHECKSUMS: &[(i64, &str)] = &[
+    (1, "d840aad4810988405befc24f2c8c97bf3f43383f5d01127cdc52a01cb734981846ecf4f57ccc059a230c18d248b789c8"),
+    (2, "97aadac65a80357fc21210f24759c34b16fc88b938d3cda3e46b4d85e8c54de2cf9c19b2ed8763a1b56ae051ea8346c9"),
+];
+
+#[test]
+fn test_released_migrations_keep_their_checksums() {
+    let migrator = sqlx::migrate!("./migrations");
+    for (version, expected) in RELEASED_MIGRATION_CHECKSUMS {
+        let migration = migrator
+            .iter()
+            .find(|migration| migration.version == *version)
+            .unwrap_or_else(|| panic!("released migration {version} was removed"));
+        let checksum = migration.checksum.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        assert_eq!(
+            &checksum, expected,
+            "released migration {version} was edited in place; add a new migration instead"
+        );
+    }
+}
+
+/// crates.io keeps the README each release published, so an install line left at the previous version stays wrong on
+/// the crate's page until the next release. Every dependency line names this release's minor version, and every
+/// `cargo install` this exact release, since its `pgqueue-migrate` must apply the migrations this release carries.
+#[test]
+fn test_readme_installs_the_current_release() {
+    let readme = include_str!("../../README.md");
+    let version = env!("CARGO_PKG_VERSION");
+    let (minor, _) = version.rsplit_once('.').expect("the crate version has a patch number");
+
+    let dependencies: Vec<&str> = readme.lines().filter(|line| line.starts_with("pgqueue = ")).collect();
+    assert!(!dependencies.is_empty(), "the README shows how to depend on pgqueue");
+    for line in dependencies {
+        assert!(line.contains(&format!("\"{minor}\"")), "{line:?} must name version {minor}");
+    }
+
+    let installs: Vec<&str> = readme.lines().filter(|line| line.starts_with("cargo install pgqueue")).collect();
+    assert!(!installs.is_empty(), "the README shows how to install pgqueue-migrate");
+    for line in installs {
+        assert!(line.contains(&format!("--version ={version} ")), "{line:?} must name version ={version}");
+    }
+}
+
+/// `CREATE SCHEMA IF NOT EXISTS` checks CREATE on the database before it checks whether the schema exists, so the
+/// migrator's own schema creation refused a role that owns a schema created for it in advance but may not create
+/// schemas, which is how a least-privilege deployment runs its migrations.
+#[sqlx::test(migrations = false)]
+async fn test_connect_migrates_an_existing_schema_without_the_database_create_privilege(pool: PgPool) {
+    let role = format!("schema_owner_{}", Uuid::now_v7().simple());
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE ROLE {role} NOLOGIN; CREATE SCHEMA pgqueue AUTHORIZATION {role}"
+    )))
     .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(deleted.rows_affected(), 1);
+    let restricted = crate::pool_with_max(&pool, 1).await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET ROLE {role}"))).execute(&restricted).await.unwrap();
+    let can_create_schemas =
+        sqlx::query_scalar::<_, bool>("SELECT has_database_privilege(current_user, current_database(), 'CREATE')")
+            .fetch_one(&restricted)
+            .await
+            .unwrap();
+    assert!(!can_create_schemas);
+
+    let queue = Queue::builder("postgres://unused").pool(restricted.clone()).connect().await.unwrap();
+    assert_eq!(queue.name(), "default");
+    drop(queue);
+    restricted.close().await;
+    // Roles outlive the test's database, and a role that owns objects anywhere cannot be dropped.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP OWNED BY {role}; DROP ROLE {role}"))).execute(&pool).await.unwrap();
+}
+
+/// GRANT and REVOKE by a role that holds privileges on the tables but cannot act as their owner only warn, so a
+/// migration made of them would be recorded as applied while changing nothing: an application role granted everything
+/// on a 0.2.0 schema connected first and left `pg_monitor` reading every payload for good. Migration 2 checks its own
+/// outcome, so such a role is refused and the database left as it was, for the owner to migrate.
+#[sqlx::test(migrations = false)]
+async fn test_migration_2_refuses_a_role_that_cannot_act_as_the_tables_owner(pool: PgPool) {
+    let all = sqlx::migrate!("./migrations");
+    let mut first = sqlx::migrate::Migrator::with_migrations(all.iter().filter(|m| m.version == 1).cloned().collect());
+    first.dangerous_set_table_name("pgqueue.migrations");
+    first.create_schema("pgqueue");
+    first.run(&pool).await.unwrap();
+    let role = format!("app_{}", Uuid::now_v7().simple());
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE ROLE {role} NOLOGIN;
+         GRANT ALL ON SCHEMA pgqueue TO {role};
+         GRANT ALL ON ALL TABLES IN SCHEMA pgqueue TO {role};"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let application = crate::pool_with_max(&pool, 1).await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET ROLE {role}"))).execute(&application).await.unwrap();
+
+    let error = Queue::builder("postgres://unused").pool(application.clone()).connect().await.unwrap_err();
+    assert!(error.to_string().contains("must be applied as pgqueue or a role with its privileges"), "{error}");
+    application.close().await;
+    let versions = sqlx::query_scalar::<_, i64>("SELECT version FROM pgqueue.migrations ORDER BY version")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(versions, [1], "the refused migration must not be recorded");
+
+    // The owner then applies it.
+    connect_queue(pool.clone()).await.unwrap();
+    let payload =
+        sqlx::query_scalar::<_, bool>("SELECT has_column_privilege('pg_monitor', 'pgqueue.jobs', 'payload', 'SELECT')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!payload);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP OWNED BY {role}; DROP ROLE {role}"))).execute(&pool).await.unwrap();
+}
+
+/// Only what migration 2 changes can refuse it. A default privilege another role holds for someone else, or a table
+/// PUBLIC can read, is not its to manage, and checking either refused even the schema owner it tells to apply it.
+#[sqlx::test(migrations = false)]
+async fn test_migration_2_applies_as_the_owner_whatever_grants_it_does_not_manage(pool: PgPool) {
+    let suffix = Uuid::now_v7().simple();
+    let (owner, dba, reporting) = (format!("owner_{suffix}"), format!("dba_{suffix}"), format!("reporting_{suffix}"));
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE ROLE {owner} NOLOGIN; CREATE ROLE {dba} NOLOGIN; CREATE ROLE {reporting} NOLOGIN;
+         CREATE SCHEMA pgqueue AUTHORIZATION {owner};
+         ALTER DEFAULT PRIVILEGES FOR ROLE {dba} IN SCHEMA pgqueue GRANT SELECT ON TABLES TO {reporting};"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let as_owner = crate::pool_with_max(&pool, 1).await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET ROLE {owner}"))).execute(&as_owner).await.unwrap();
+    // A 0.2.0 database, migrated by its owner, whose jobs table PUBLIC can read.
+    let all = sqlx::migrate!("./migrations");
+    let mut first = sqlx::migrate::Migrator::with_migrations(all.iter().filter(|m| m.version == 1).cloned().collect());
+    first.dangerous_set_table_name("pgqueue.migrations");
+    first.run(&as_owner).await.unwrap();
+    sqlx::query("GRANT SELECT ON pgqueue.jobs TO PUBLIC").execute(&as_owner).await.unwrap();
+
+    Queue::builder("postgres://unused").pool(as_owner.clone()).connect().await.unwrap();
+    as_owner.close().await;
+    let versions = sqlx::query_scalar::<_, i64>("SELECT version FROM pgqueue.migrations ORDER BY version")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(versions, [1, 2]);
+    let metadata = sqlx::query_scalar::<_, bool>(
+        "SELECT has_column_privilege('pg_monitor', 'pgqueue.workers', 'metadata', 'SELECT')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!metadata, "pg_monitor's own grants were narrowed");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP OWNED BY {dba}; DROP OWNED BY {reporting}; DROP OWNED BY {owner}; DROP ROLE {owner}, {dba}, {reporting}"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
+/// Everything a migration defines that the code can observe, keyed by name rather than by position. Column order is
+/// the one difference a repaired schema keeps, since `ADD COLUMN` appends, and no query depends on it.
+async fn schema_fingerprint(pool: &PgPool) -> serde_json::Value {
+    sqlx::query_scalar::<_, serde_json::Value>(
+        r#"
+        SELECT jsonb_build_object(
+            'columns', (
+                SELECT jsonb_agg(jsonb_build_array(table_name, column_name, data_type, is_nullable, column_default)
+                                 ORDER BY table_name, column_name)
+                FROM information_schema.columns WHERE table_schema = 'pgqueue'),
+            'constraints', (
+                SELECT jsonb_agg(jsonb_build_array(conrelid::regclass::text, conname, pg_get_constraintdef(oid),
+                                                   convalidated)
+                                 ORDER BY conrelid::regclass::text, conname)
+                FROM pg_constraint WHERE connamespace = 'pgqueue'::regnamespace),
+            'indexes', (
+                SELECT jsonb_agg(jsonb_build_array(indexname, indexdef) ORDER BY indexname)
+                FROM pg_indexes WHERE schemaname = 'pgqueue'),
+            'functions', (
+                SELECT jsonb_agg(pg_get_functiondef(oid) ORDER BY oid::regprocedure::text)
+                FROM pg_proc WHERE pronamespace = 'pgqueue'::regnamespace),
+            'triggers', (
+                SELECT jsonb_agg(pg_get_triggerdef(oid) ORDER BY tgname)
+                FROM pg_trigger WHERE NOT tgisinternal AND tgrelid::regclass::text LIKE 'pgqueue.%'),
+            'grants', (
+                SELECT jsonb_agg(jsonb_build_array(table_name, grantee, privilege_type)
+                                 ORDER BY table_name, grantee, privilege_type)
+                FROM information_schema.role_table_grants WHERE table_schema = 'pgqueue'),
+            'column_grants', (
+                SELECT jsonb_agg(jsonb_build_array(table_name, column_name, grantee, privilege_type)
+                                 ORDER BY table_name, column_name, grantee, privilege_type)
+                FROM information_schema.column_privileges WHERE table_schema = 'pgqueue'),
+            'history', (
+                SELECT jsonb_agg(jsonb_build_array(version, description, success, encode(checksum, 'hex'))
+                                 ORDER BY version)
+                FROM pgqueue.migrations)
+        )
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// pgqueue 0.2.0 edited migration 1 in place, so a database that 0.1.0 migrated recorded a checksum every later
+/// release refused, and lacked the column, check and page functions the edit added. Connecting repairs it to what a
+/// fresh install creates, keeps its jobs, and does so once however many processes connect at the same moment.
+#[sqlx::test(migrations = false)]
+async fn test_connect_repairs_a_schema_migrated_by_v0_1(pool: PgPool) {
+    let mut v0_1 = sqlx::migrate::Migrator::new(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/v0.1.0"
+    )))
+    .await
+    .unwrap();
+    v0_1.dangerous_set_table_name("pgqueue.migrations");
+    v0_1.create_schema("pgqueue");
+    v0_1.run(&pool).await.unwrap();
+    let recorded =
+        sqlx::query_scalar::<_, String>("SELECT encode(checksum, 'hex') FROM pgqueue.migrations WHERE version = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(recorded.starts_with("ad4a0842"), "the fixture must be migration 1 exactly as 0.1.0 shipped it");
+    let legacy = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO pgqueue.jobs (queue, name, payload) VALUES ('default', 'legacy', '{}') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let (first, second) = tokio::join!(connect_queue(pool.clone()), connect_queue(pool.clone()));
+    let queue = first.unwrap();
+    second.unwrap();
+
+    let reference = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&crate::fresh_database("v0_1_repair_reference").await)
+        .await
+        .unwrap();
+    Queue::builder("postgres://unused").pool(reference.clone()).connect().await.unwrap();
+    assert_eq!(schema_fingerprint(&pool).await, schema_fingerprint(&reference).await);
+    reference.close().await;
+
+    let claimed = queue.dequeue(1, Uuid::now_v7()).await.unwrap();
+    assert_eq!(claimed.iter().map(|job| (job.id, job.attempts)).collect::<Vec<_>>(), vec![(legacy, 1)]);
+}
+
+/// Migration 1 creates the tables, so with its history gone re-applying it fails on objects that already exist.
+/// Every history row goes, not only migration 1's: without it the rest would no longer be an applied prefix, which is
+/// refused before anything is applied.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_connect_releases_the_migration_lock_after_applying_a_missing_history_entry_fails(pool: PgPool) {
+    let deleted = sqlx::query("DELETE FROM pgqueue.migrations").execute(&pool).await.unwrap();
+    assert_eq!(deleted.rows_affected(), crate::migration_versions().len() as u64);
 
     let error = connect_queue(pool.clone()).await.unwrap_err();
     assert!(matches!(error, Error::Migration(_)), "{error}");
@@ -1814,6 +2064,95 @@ async fn test_dequeue_marks_rows_active(pool: PgPool) {
 
     // Nothing left.
     assert!(db.queue.dequeue(5, worker).await.unwrap().is_empty());
+}
+
+/// Valid `jsonb` that serde_json cannot read — nested past its recursion limit, which no build feature lifts — is one
+/// `INSERT` away for any foreign SQL writer. Such a row used to fail every claim that reached it and stay first in
+/// line, stalling its whole queue; now the claim fails that row, keeps its JSON for inspection, wakes anyone waiting
+/// on it, and hands out the rest.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_dequeue_fails_a_row_whose_json_cannot_be_read_and_claims_the_rest(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let nested = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+    let unreadable = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO pgqueue.jobs (queue, name, payload, priority, max_attempts, awaited)
+         VALUES ($1, 'unreadable', $2::jsonb, -1, 3, true) RETURNING id",
+    )
+    .bind(db.queue.name())
+    .bind(&nested)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let readable = db.queue.enqueue_raw(new_job("readable", |_| {})).await.unwrap().unwrap();
+    let mut listener = listen(&pool, &pgqueue::__test_support::done_channel(db.queue.name())).await;
+
+    let claimed = db.queue.dequeue(10, Uuid::now_v7()).await.unwrap();
+    assert_eq!(claimed.iter().map(|job| job.id).collect::<Vec<_>>(), vec![readable]);
+
+    let (status, error, payload) = sqlx::query_as::<_, (String, Option<String>, String)>(
+        "SELECT status, error, payload::text FROM pgqueue.jobs WHERE id = $1",
+    )
+    .bind(unreadable)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "failed", "a row that can never run is failed, not retried");
+    let error = error.unwrap();
+    assert!(error.starts_with("pgqueue could not read this job's stored payload: "), "{error}");
+    assert_eq!(payload.matches('[').count(), 200, "the stored JSON is kept for an operator to inspect");
+    let notification = tokio::time::timeout(Duration::from_secs(5), listener.recv()).await.unwrap().unwrap();
+    assert!(notification.payload().contains(&unreadable.to_string()), "{}", notification.payload());
+    assert!(notification.payload().contains(r#""status":"failed""#), "{}", notification.payload());
+    assert_eq!(db.queue.stats().failed, 1);
+
+    assert!(db.queue.dequeue(10, Uuid::now_v7()).await.unwrap().is_empty(), "the queue is not stalled behind it");
+}
+
+/// The quarantine finishes a row as every other terminal statement does: one whose failure retention is zero is deleted
+/// rather than kept `failed`.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_dequeue_deletes_an_unreadable_row_whose_failure_retention_is_zero(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let nested = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+    let unreadable = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO pgqueue.jobs (queue, name, meta, failed_ttl_ms) VALUES ($1, 'unreadable', $2::jsonb, 0)
+         RETURNING id",
+    )
+    .bind(db.queue.name())
+    .bind(&nested)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert!(db.queue.dequeue(10, Uuid::now_v7()).await.unwrap().is_empty());
+    let remaining = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pgqueue.jobs WHERE id = $1")
+        .bind(unreadable)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0, "a zero failure retention deletes the row");
+    assert_eq!(db.queue.stats().failed, 1);
+}
+
+/// Only a document serde_json cannot read is one row's problem. A type mismatch after the schema drifted fails every
+/// row the same way, so the claim is refused and the rows stay queued, rather than the whole backlog being failed
+/// claim by claim.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_dequeue_refuses_the_claim_when_a_document_column_changed_type(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    for _ in 0..2 {
+        db.queue.enqueue_raw(new_job("drifted", |_| {})).await.unwrap();
+    }
+    sqlx::query("ALTER TABLE pgqueue.jobs ALTER COLUMN meta TYPE text").execute(&pool).await.unwrap();
+
+    let error = db.queue.dequeue(10, Uuid::now_v7()).await.unwrap_err();
+    assert!(matches!(error, Error::Db(sqlx::Error::ColumnDecode { .. })), "{error:?}");
+    let rows = sqlx::query_as::<_, (String, i32)>("SELECT status, attempts FROM pgqueue.jobs WHERE queue = $1")
+        .bind(db.queue.name())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, [("queued".to_owned(), 0), ("queued".to_owned(), 0)]);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -2539,21 +2878,57 @@ async fn test_dropping_an_unsettled_consumer_attempt_off_runtime_recovers_the_jo
     assert_ne!(replacement, id, "recovery must release the terminal job's dedupe key");
 }
 
+/// Every message the events it sees carry, for asserting what a path did or did not log.
+#[derive(Clone, Default)]
+struct RecordedMessages(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl RecordedMessages {
+    fn recorded(&self) -> Vec<String> {
+        self.0.lock().expect("recorded messages").clone()
+    }
+}
+
+impl tracing::field::Visit for RecordedMessages {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0.lock().expect("recorded messages").push(format!("{value:?}"));
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for RecordedMessages {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        event.record(&mut self.clone());
+    }
+}
+
 /// And the recovery's guards make it a no-op once the row has moved on, so a
 /// settled attempt dropping in the ordinary way cannot disturb its successor.
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dropping_a_settled_consumer_attempt_leaves_the_row_alone(pool: PgPool) {
+    use tracing_subscriber::layer::SubscriberExt;
+
     let db = TestDb::new(pool.clone()).await;
     let id =
         db.queue.enqueue_raw(with_config("dropped-settled", |config| config.max_attempts = 3)).await.unwrap().unwrap();
     let consumer = leased_consumer(&db.queue, Uuid::now_v7()).await;
     let attempt = consumer.dequeue(1).await.unwrap().into_iter().next().unwrap();
     assert!(attempt.finish(JobStatus::Complete, Some(json!("done")), None).await.unwrap());
+    // Thread-local, and this runtime runs a spawned resolver on this thread, so whatever one logs lands here.
+    let recorded = RecordedMessages::default();
+    let guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry::Registry::default().with(recorded.clone()));
     drop(attempt);
 
-    // Nothing to race: a settled attempt spawns no resolver at all. Give one a
-    // chance to land anyway, then assert the terminal row is untouched.
+    // Nothing to race: a settled attempt spawns no resolver at all. A resolver's
+    // guards would leave the terminal row alone too, so the row cannot tell
+    // whether one ran; the resolver's log can. Give one a chance to land, then
+    // check both.
     tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(guard);
+    let resolver_logs =
+        recorded.recorded().into_iter().filter(|message| message.contains("dropped attempt")).collect::<Vec<_>>();
+    assert!(resolver_logs.is_empty(), "a settled attempt spawned a resolver: {resolver_logs:?}");
     let row = db.queue.fetch_job(id).await.unwrap().unwrap();
     assert_eq!(row.status, JobStatus::Complete);
     assert_eq!(row.result, Some(json!("done")));
@@ -6233,16 +6608,52 @@ async fn test_purge_queued_jobs_refuses_a_nul_name(pool: PgPool) {
     assert!(db.queue.fetch_job(queued).await.unwrap().is_some());
 }
 
-/// The built-in monitoring role reads every table of the schema and writes
-/// none of it, so a metrics exporter needs no grant per deployment.
+/// The built-in monitoring role reads the columns a metrics exporter counts and watches, so it needs no grant per
+/// deployment, and none of the documents applications store: `pg_monitor` is the role monitoring agents are routinely
+/// granted, and job payloads, results, errors and metadata can hold tokens or personal data. It writes nothing.
 #[sqlx::test(migrations = "./migrations")]
-async fn test_pg_monitor_can_read_every_table_and_write_none(pool: PgPool) {
-    let _db = TestDb::new(pool.clone()).await;
+async fn test_pg_monitor_reads_the_counted_columns_and_no_stored_documents(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
     let usage = sqlx::query_scalar::<_, bool>("SELECT has_schema_privilege('pg_monitor', 'pgqueue', 'USAGE')")
         .fetch_one(&pool)
         .await
         .unwrap();
     assert!(usage, "pg_monitor must have USAGE on the schema");
+    let column = |table: &'static str, column: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>("SELECT has_column_privilege('pg_monitor', $1, $2, 'SELECT')")
+                .bind(format!("pgqueue.{table}"))
+                .bind(column)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    for (table, readable) in [
+        ("jobs", "status"),
+        ("jobs", "scheduled_at"),
+        ("workers", "expires_at"),
+        ("cron_schedules", "next_run_at"),
+        ("cron_occurrences", "scheduled_at"),
+        ("migrations", "version"),
+    ] {
+        assert!(column(table, readable).await, "pg_monitor must read pgqueue.{table}.{readable}");
+    }
+    for (table, document) in [
+        ("jobs", "payload"),
+        ("jobs", "result"),
+        ("jobs", "error"),
+        ("jobs", "meta"),
+        ("jobs", "dedupe_key"),
+        ("workers", "stats"),
+        ("workers", "metadata"),
+        ("cron_schedules", "definition"),
+        ("cron_schedules", "dedupe_key"),
+        ("cron_occurrences", "dedupe_key"),
+    ] {
+        assert!(!column(table, document).await, "pg_monitor must not read pgqueue.{table}.{document}");
+    }
     for table in [
         "jobs",
         "workers",
@@ -6250,14 +6661,20 @@ async fn test_pg_monitor_can_read_every_table_and_write_none(pool: PgPool) {
         "cron_occurrences",
         "migrations",
     ] {
-        let (select, insert) = sqlx::query_as::<_, (bool, bool)>(
-            "SELECT has_table_privilege('pg_monitor', $1, 'SELECT'), has_table_privilege('pg_monitor', $1, 'INSERT')",
-        )
-        .bind(format!("pgqueue.{table}"))
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(select, "pg_monitor must be able to read pgqueue.{table}");
+        let insert = sqlx::query_scalar::<_, bool>("SELECT has_table_privilege('pg_monitor', $1, 'INSERT')")
+            .bind(format!("pgqueue.{table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert!(!insert, "pg_monitor must not be able to write pgqueue.{table}");
     }
+
+    // What the grants are for: an exporter connecting as the role reads the queue's counts.
+    db.queue.enqueue_raw(new_job("counted", |_| {})).await.unwrap();
+    let monitor = crate::pool_with_max(&pool, 1).await;
+    sqlx::query("SET ROLE pg_monitor").execute(&monitor).await.unwrap();
+    let exporter = Queue::builder("postgres://unused").pool(monitor.clone()).connect().await.unwrap();
+    assert_eq!(exporter.counts().await.unwrap().queued, 1);
+    let refused = sqlx::query("SELECT payload FROM pgqueue.jobs").fetch_all(&monitor).await.unwrap_err();
+    assert!(refused.to_string().contains("permission denied"), "{refused}");
 }

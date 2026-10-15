@@ -1,7 +1,6 @@
 //! The `#[pgqueue::job]` / `#[pgqueue::cron]` expansions, kept as pure token
 //! transforms so they can be unit-tested without compiling user code.
 
-use cronexpr::{FallbackTimezoneOption, ParseOptions};
 use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::{ToTokens, format_ident, quote, quote_spanned};
@@ -12,7 +11,7 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{AttrStyle, Attribute, FnArg, Ident, ItemFn, Meta, ReturnType, Token, Type};
 
-use crate::attrs::{AttrMode, JobAttrs, ResultTtl, split_leading_str};
+use crate::attrs::{AttrMode, JobAttrs, ResultTtl, cron_parse_options, split_leading_str};
 
 /// Which attribute is expanding; drives the signature contract and generated
 /// registration marker.
@@ -59,9 +58,7 @@ pub(crate) fn expand_cron(attr: TokenStream, item: TokenStream) -> syn::Result<T
             format!("invalid cron expression {schedule:?}: expected 5 whitespace-separated fields"),
         ));
     }
-    let mut options = ParseOptions::default();
-    options.fallback_timezone_option = FallbackTimezoneOption::UTC;
-    let crontab = cronexpr::parse_crontab_with(&schedule, options)
+    let crontab = cronexpr::parse_crontab_with(&schedule, cron_parse_options())
         .map_err(|e| syn::Error::new_spanned(&expr, format!("invalid cron expression {schedule:?}: {e}")))?;
     reject_a_schedule_that_never_fires(&expr, &schedule, &crontab)?;
     let attrs = JobAttrs::parse(rest, AttrMode::Cron)?;
@@ -383,6 +380,11 @@ fn expand(mode: Mode, attrs: JobAttrs, item: TokenStream) -> syn::Result<TokenSt
         })
     };
 
+    // The handler, taken as a value before it is called. `clippy::unused_async` told a handler that awaits nothing to
+    // drop its `async`, which the attribute requires, so under `clippy::pedantic` every such job needed an allow; a
+    // function used as a value is one clippy knows cannot change its signature, and leaves alone.
+    let handler_binding = quote!(let __handler = #ident;);
+
     // The struct is named after the user's snake_case function, which `non_camel_case_types` reports. Allowed with an
     // attribute, the expansion broke under every enclosing `forbid` — a crate's `#![forbid(nonstandard_style)]`, a
     // `[lints]` table, `-F` on the command line — as `error[E0453]`, which nothing on the job can lower. Resolved at
@@ -427,7 +429,8 @@ fn expand(mode: Mode, attrs: JobAttrs, item: TokenStream) -> syn::Result<TokenSt
                 /// Invokes the underlying handler function directly,
                 /// bypassing the queue — useful in unit tests.
                 #vis async fn call(#(#call_params),*) -> #ret_ty {
-                    #ident(#(#call_names),*).await
+                    #handler_binding
+                    __handler(#(#call_names),*).await
                 }
             }
 
@@ -774,6 +777,21 @@ fn validate(mode: &Mode, func: &ItemFn) -> syn::Result<()> {
                 ),
             ));
         }
+        // A job's first parameter is its payload, so an extractor written first — a cron's signature copied onto a
+        // job — failed as three `serde` errors on `JobContext`, one of them advising `#[derive(Deserialize)]` on it.
+        if matches!(mode, Mode::Job)
+            && position == 0
+            && let Some(extractor) = leading_extractor(&argument.ty)
+        {
+            return Err(syn::Error::new_spanned(
+                &argument.ty,
+                format!(
+                    "the first parameter of a #[pgqueue::job] function is its payload; for a job without one, \
+                     write `_: ()` or `(): ()` first and take the `{extractor}` after it, or, if `{extractor}` is a \
+                     payload type of your own, write it through its module path, such as `crate::{extractor}`"
+                ),
+            ));
+        }
         // The payload is decoded from the job row through `DeserializeOwned` and
         // re-emitted as the associated type `JobType::Args`, so it cannot
         // borrow. A lifetime left to elision declares no generic parameter and
@@ -796,11 +814,12 @@ fn validate(mode: &Mode, func: &ItemFn) -> syn::Result<()> {
             && let Some(borrow) = borrowed_part(&argument.ty)
         {
             return Err(syn::Error::new_spanned(
-                borrow,
+                &borrow.tokens,
                 format!(
                     "{} functions cannot take a borrowed payload; it is deserialized \
-                     from storage, so it must be owned",
-                    mode.attr_name()
+                     from storage, so it must be owned{}",
+                    mode.attr_name(),
+                    borrow.hint()
                 ),
             ));
         }
@@ -829,11 +848,12 @@ fn validate(mode: &Mode, func: &ItemFn) -> syn::Result<()> {
         && let Some(borrow) = borrowed_part(ty)
     {
         return Err(syn::Error::new_spanned(
-            borrow,
+            &borrow.tokens,
             format!(
                 "{} functions cannot return a borrowed type; the output is serialized \
-                 into the job row and read back, so it must be owned",
-                mode.attr_name()
+                 into the job row and read back, so it must be owned{}",
+                mode.attr_name(),
+                borrow.hint()
             ),
         ));
     }
@@ -841,13 +861,46 @@ fn validate(mode: &Mode, func: &ItemFn) -> syn::Result<()> {
         return Err(syn::Error::new_spanned(
             &func.sig.ident,
             "#[pgqueue::job] functions need a payload as their first parameter; \
-             use `_: ()` for jobs without one",
+             use `_: ()` for jobs without one, or `(): ()`, which `clippy::ignored_unit_patterns` accepts",
         ));
     }
     if let Some(variadic) = &func.sig.variadic {
         return Err(syn::Error::new_spanned(variadic, format!("{} functions cannot be variadic", mode.attr_name())));
     }
     Ok(())
+}
+
+/// The pgqueue extractor `ty` names, if it can name one: `JobContext`, or `JobState<T>`, written bare or through the
+/// runtime crate (`pgqueue::…`, or the name the package depends on it under).
+///
+/// Only those can be pgqueue's own, which derive no `Deserialize` and so never compile as a payload anyway. A type of
+/// the user's own that shares the name and is written through another path — `crate::`, `self::`, `super::`, a module
+/// — is a payload like any other and is left alone; the error names that way out for a bare one.
+fn leading_extractor(ty: &Type) -> Option<&'static str> {
+    let Type::Path(path) = without_type_wrappers(ty) else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    let segments = &path.path.segments;
+    let last = segments.last()?;
+    let extractor = match (last.ident.to_string().as_str(), &last.arguments) {
+        ("JobContext", syn::PathArguments::None) => "JobContext",
+        ("JobState", syn::PathArguments::AngleBracketed(_)) => "JobState",
+        _ => return None,
+    };
+    let names_pgqueue = match segments.first() {
+        Some(first) if segments.len() > 1 => names_runtime_crate(&first.ident),
+        _ => path.path.leading_colon.is_none(),
+    };
+    names_pgqueue.then_some(extractor)
+}
+
+/// Whether a path's first segment names the runtime crate: `pgqueue`, or the name this package depends on it under.
+fn names_runtime_crate(segment: &Ident) -> bool {
+    let name = segment.unraw().to_string();
+    name == "pgqueue" || matches!(crate_name("pgqueue"), Ok(FoundCrate::Name(dependency)) if dependency == name)
 }
 
 /// The bound name this identifier would collide with in the expansion, if any.
@@ -860,8 +913,9 @@ fn reserved_expansion_name(ident: &syn::Ident) -> Option<String> {
     let numbered = |prefix: &str| {
         name.strip_prefix(prefix).is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
     };
-    let collides =
-        matches!(name, "__config" | "__args" | "__ctx" | "__result") || numbered("__ext") || numbered("__arg");
+    let collides = matches!(name, "__config" | "__args" | "__ctx" | "__result" | "__handler")
+        || numbered("__ext")
+        || numbered("__arg");
     collides.then(|| name.to_string())
 }
 
@@ -879,16 +933,46 @@ fn without_type_wrappers(mut ty: &Type) -> &Type {
     }
 }
 
+/// What makes a payload or output type borrow, found by [`borrowed_part`].
+struct Borrow {
+    /// The tokens the error points at.
+    tokens: TokenStream,
+    /// For a standard `Cow` written without its lifetime, the type it borrows (`str`, `[u8]`), which the error uses
+    /// to show the owned spelling.
+    cow_target: Option<String>,
+}
+
+impl Borrow {
+    /// How to write the type owned, appended to the error, for the one borrow this cannot read off a `&` or a `'_`.
+    fn hint(&self) -> String {
+        match &self.cow_target {
+            Some(target) => format!(
+                "; a `Cow` written without a lifetime borrows, so write `Cow<'static, {target}>`, or \
+                 `std::borrow::Cow<'static, {target}>` where `Cow` names an alias"
+            ),
+            None => String::new(),
+        }
+    }
+}
+
 /// The tokens that make a payload or output type borrow, if any: the type itself when it is a reference, whatever its
-/// lifetime, or else the first lifetime left to elision anywhere inside it — a `&` written without one, or a `'_`.
+/// lifetime, or else the first lifetime left to elision anywhere inside it — a `&` written without one, a `'_`, or a
+/// standard `Cow` written without its lifetime parameter, as in `Cow<str>`.
 ///
 /// A lifetime left to elision is never legal in the associated type the expansion re-emits the type as, so refusing
 /// one rejects nothing that compiles. Two places are not searched, because elision there is legal: `fn(&str)` and
 /// `Fn(&str)` sugar, where it is higher-ranked, and expressions — an array length, a const argument — where it is
 /// inferred. A lifetime *named* inside the type is left alone too: `Cow<'static, str>` is a valid payload.
-fn borrowed_part(ty: &Type) -> Option<TokenStream> {
+///
+/// The `Cow` case is the one exception to that rule, because only syntax is visible here. It matches only what is
+/// almost always the standard type: `Cow`, `borrow::Cow`, `std::borrow::Cow` or `alloc::borrow::Cow` borrowing one
+/// of the unsized types the standard `Cow` is used with (`str`, `[T]`, `Path`, `OsStr`, `CStr`), so an owned type of
+/// the user's own named `Cow` passes. A crate alias such as `type Cow<T> = std::borrow::Cow<'static, T>` is refused
+/// all the same, which is why that error names the full path as the way out. Any other type written without its
+/// lifetime still fails to compile, only with rustc's own error in the expansion.
+fn borrowed_part(ty: &Type) -> Option<Borrow> {
     struct ElidedLifetimeVisitor {
-        found: Option<TokenStream>,
+        found: Option<Borrow>,
     }
 
     impl<'ast> Visit<'ast> for ElidedLifetimeVisitor {
@@ -897,7 +981,7 @@ fn borrowed_part(ty: &Type) -> Option<TokenStream> {
                 return;
             }
             if node.lifetime.is_none() {
-                self.found = Some(node.to_token_stream());
+                self.found = Some(Borrow { tokens: node.to_token_stream(), cow_target: None });
                 return;
             }
             syn::visit::visit_type_reference(self, node);
@@ -905,8 +989,21 @@ fn borrowed_part(ty: &Type) -> Option<TokenStream> {
 
         fn visit_lifetime(&mut self, node: &'ast syn::Lifetime) {
             if self.found.is_none() && node.ident == "_" {
-                self.found = Some(node.to_token_stream());
+                self.found = Some(Borrow { tokens: node.to_token_stream(), cow_target: None });
             }
+        }
+
+        fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
+            if self.found.is_some() {
+                return;
+            }
+            if node.qself.is_none()
+                && let Some(target) = elided_std_cow_target(&node.path)
+            {
+                self.found = Some(Borrow { tokens: node.to_token_stream(), cow_target: Some(target) });
+                return;
+            }
+            syn::visit::visit_type_path(self, node);
         }
 
         fn visit_type_fn_ptr(&mut self, _node: &'ast syn::TypeFnPtr) {}
@@ -917,11 +1014,45 @@ fn borrowed_part(ty: &Type) -> Option<TokenStream> {
     }
 
     if let Type::Reference(reference) = without_type_wrappers(ty) {
-        return Some(reference.to_token_stream());
+        return Some(Borrow { tokens: reference.to_token_stream(), cow_target: None });
     }
     let mut visitor = ElidedLifetimeVisitor { found: None };
     visitor.visit_type(ty);
     visitor.found
+}
+
+/// The type a standard `Cow` path borrows, written as the user wrote it, when the path leaves its lifetime out: see
+/// [`borrowed_part`] for which paths count.
+fn elided_std_cow_target(path: &syn::Path) -> Option<String> {
+    let names = path.segments.iter().map(|segment| segment.ident.to_string()).collect::<Vec<_>>();
+    let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+    let standard = match names.as_slice() {
+        ["Cow"] | ["borrow", "Cow"] => path.leading_colon.is_none(),
+        ["std" | "alloc", "borrow", "Cow"] => true,
+        _ => false,
+    };
+    let last = path.segments.last()?;
+    if !standard || path.segments.iter().rev().skip(1).any(|segment| !segment.arguments.is_empty()) {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(arguments) = &last.arguments else {
+        return None;
+    };
+    let [syn::GenericArgument::Type(target)] = arguments.args.iter().collect::<Vec<_>>().as_slice() else {
+        return None;
+    };
+    let unsized_target = match without_type_wrappers(target) {
+        Type::Slice(_) => true,
+        Type::Path(target) => {
+            target.qself.is_none()
+                && target.path.segments.last().is_some_and(|segment| {
+                    segment.arguments.is_empty()
+                        && matches!(segment.ident.to_string().as_str(), "str" | "Path" | "OsStr" | "CStr")
+                })
+        }
+        _ => false,
+    };
+    unsized_target.then(|| target.to_token_stream().to_string().replace(" :: ", "::").replace(" ;", ";"))
 }
 
 fn is_impl_trait(ty: &Type) -> bool {
@@ -1039,6 +1170,38 @@ mod tests {
 
     fn compact(s: &str) -> String {
         s.replace(' ', "")
+    }
+
+    /// Every name the expansion binds, raw or not, and only those: a job named after one emits a unit struct that
+    /// turns the binding in every other job of the module into a path pattern, which fails there with E0530.
+    #[test]
+    fn test_reserved_expansion_name_covers_every_bound_name() {
+        let reserved = |name: &str| reserved_expansion_name(&syn::parse_str::<syn::Ident>(name).unwrap());
+        for name in [
+            "__config",
+            "__args",
+            "__ctx",
+            "__result",
+            "__handler",
+            "__arg0",
+            "__arg12",
+            "__ext0",
+            "__ext7",
+            "r#__result",
+        ] {
+            assert_eq!(reserved(name).as_deref(), Some(name.trim_start_matches("r#")), "{name} must be reserved");
+        }
+        for name in [
+            "__arg",
+            "__ext",
+            "__argx",
+            "__ext1a",
+            "config",
+            "__results",
+            "send_email",
+        ] {
+            assert_eq!(reserved(name), None, "{name} is not bound by the expansion");
+        }
     }
 
     #[test]
@@ -1451,6 +1614,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_call_takes_the_handler_as_a_value_before_calling_it() {
+        // `clippy::unused_async` tells an `async fn` that awaits nothing to drop its `async`, which the attribute
+        // requires, so under `clippy::pedantic` every such handler needed an allow. A function used as a value is one
+        // clippy knows cannot change its signature, and leaves alone; dropping this binding brings the lint back.
+        let out = expand_ok(
+            quote!(),
+            quote!(
+                async fn notify((): ()) {}
+            ),
+        );
+        assert!(compact(&out).contains("let__handler=notify;__handler(__arg0).await"), "{out}");
+        let out = expand_cron_ok(
+            quote!("0 * * * *"),
+            quote!(
+                async fn hourly() {}
+            ),
+        );
+        assert!(compact(&out).contains("let__handler=hourly;__handler().await"), "{out}");
+    }
+
     /// `#[tracing::instrument]` is the motivating example for leaving
     /// non-lint attributes on the hidden function, and it derives its span name
     /// from the identifier. Renaming the function to a private placeholder
@@ -1474,7 +1658,7 @@ mod tests {
         );
         assert!(flat.contains("#[tracing::instrument]asyncfnsend_email(args:SendEmail)"), "{out}");
         assert!(flat.contains("send_email(__args)"), "{out}");
-        assert!(flat.contains("send_email(__arg0).await"), "{out}");
+        assert!(flat.contains("let__handler=send_email;__handler(__arg0).await"), "{out}");
 
         // The same for cron, whose erased call takes extractors only.
         let out = expand_cron_ok(
@@ -1873,10 +2057,30 @@ mod tests {
                 "{payload}"
             );
         }
+        // A standard `Cow` written without its lifetime borrows just the same, and its error shows the owned form.
+        for (payload, target) in [
+            (quote!(Cow<str>), "str"),
+            (quote!(std::borrow::Cow<str>), "str"),
+            (quote!(Option<Cow<[u8]>>), "[u8]"),
+            (quote!(alloc::borrow::Cow<std::path::Path>), "std::path::Path"),
+        ] {
+            let err = expand_job(quote!(), quote!(async fn j(_: #payload) {})).unwrap_err().to_string();
+            assert!(err.starts_with("#[pgqueue::job] functions cannot take a borrowed payload"), "{payload}: {err}");
+            assert!(err.contains(&format!("write `Cow<'static, {target}>`")), "{payload}: {err}");
+            assert!(
+                err.contains(&format!("`std::borrow::Cow<'static, {target}>` where `Cow` names an alias")),
+                "{err}"
+            );
+        }
         // A named lifetime can be legitimate; elision in `fn` and `Fn` sugar is
-        // higher-ranked, and in an expression it is inferred.
+        // higher-ranked, and in an expression it is inferred. An owned type of the user's own that happens to be named
+        // `Cow` borrows nothing, and neither does a `Cow` path the standard library does not have.
         for payload in [
             quote!(std::borrow::Cow<'static, str>),
+            quote!(Cow<u32>),
+            quote!(farm::Cow<String>),
+            quote!(farm::Cow<str>),
+            quote!(Cow<String>),
             quote!(Option<&'static str>),
             quote!(fn(&str) -> &str),
             quote!(Box<dyn Fn(&str) -> &str + Send>),
@@ -1899,6 +2103,7 @@ mod tests {
             quote!(&'static str),
             quote!(anyhow::Result<&str>),
             quote!(Result<Cow<'_, str>, Error>),
+            quote!(anyhow::Result<Cow<str>>),
         ] {
             for err in [
                 expand_job(quote!(), quote!(async fn j(_: ()) -> #output {})).unwrap_err(),
@@ -1906,6 +2111,13 @@ mod tests {
             ] {
                 assert!(err.to_string().contains("functions cannot return a borrowed type"), "{output}: {err}");
             }
+        }
+        for output in [
+            quote!(anyhow::Result<Cow<u32>>),
+            quote!(anyhow::Result<Vec<farm::Cow<u8>>>),
+        ] {
+            expand_ok(quote!(), quote!(async fn j(_: ()) -> #output {}));
+            expand_cron_ok(quote!("* * * * *"), quote!(async fn c() -> #output {}));
         }
         expand_ok(
             quote!(),
@@ -1934,6 +2146,43 @@ mod tests {
             assert!(compact(&out).contains(&format!("<{written}as::pgqueue::FromJobContext>::from_context")), "{out}");
             expand_cron_ok(quote!("* * * * *"), quote!(async fn c(config: #extractor) {}));
         }
+    }
+
+    /// A cron's signature copied onto a job puts an extractor where the payload goes, which failed as `serde` errors
+    /// on `JobContext`; the refusal names the payload slot instead. A payload type of the user's own that shares a
+    /// name without `JobState`'s type argument is still a payload.
+    #[test]
+    fn test_refuses_an_extractor_in_the_payload_position() {
+        for (first, extractor) in [
+            (quote!(ctx: JobContext), "JobContext"),
+            (quote!(ctx: pgqueue::JobContext), "JobContext"),
+            (quote!(ctx: ::pgqueue::JobContext), "JobContext"),
+            (quote!(config: JobState<Config>), "JobState"),
+            (quote!(config: pgqueue::JobState<Config>), "JobState"),
+        ] {
+            let err = expand_job(quote!(), quote!(async fn j(#first) {})).unwrap_err().to_string();
+            assert!(err.starts_with("the first parameter of a #[pgqueue::job] function is its payload"), "{err}");
+            assert!(err.contains(&format!("take the `{extractor}` after it")), "{err}");
+            assert!(err.contains(&format!("such as `crate::{extractor}`")), "{err}");
+        }
+        // A payload type of the user's own that shares a name, written through any path but the runtime crate's, and
+        // a `JobState` without the type argument pgqueue's always has, are payloads like any other.
+        for payload in [
+            quote!(JobState),
+            quote!(app::JobContext),
+            quote!(crate::app::JobContext),
+            quote!(self::JobContext),
+            quote!(super::JobContext),
+            quote!(app::JobState<u32>),
+        ] {
+            expand_ok(quote!(), quote!(async fn j(_: #payload) {}));
+        }
+        expand_ok(
+            quote!(),
+            quote!(
+                async fn j((): (), ctx: JobContext) {}
+            ),
+        );
     }
 
     #[test]

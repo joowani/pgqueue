@@ -15,6 +15,7 @@ import {
   exceedsJobNameLimit,
   isSuggestionResponseCurrent,
   matchesNoJobName,
+  PART_BREAK,
   pageOf,
   parseJsonExactly,
   parseRoute,
@@ -430,6 +431,13 @@ for (const actionKind of ["abort", "retry"]) {
     await new Promise(setImmediate);
     assert.ok(app.innerHTML.includes(`Job ${nextId}`));
     void handlers.get("click")({ target: action, preventDefault() {} });
+    if (actionKind === "abort") {
+      // Abort asks first (see the confirmation test below), so the post waits for the answer.
+      assert.equal(requests.filter(({ method }) => method === "POST").length, 0);
+      const confirm = { dataset: {} };
+      confirm.closest = (selector) => (selector === "button[data-confirm-abort]" ? confirm : null);
+      void handlers.get("click")({ target: confirm, preventDefault() {} });
+    }
     assert.deepEqual(requests.filter(({ method }) => method === "POST"), [
       { url: `/api/queues/main/jobs/${nextId}/${actionKind}`, method: "POST" },
     ]);
@@ -449,13 +457,22 @@ const textSelection = () => ({
 });
 
 // A stand-in for one element of a painted page that the module looks up again, by its `id` or by one of the few
-// classes it queries. Its attributes and `data-*` come from its start tag, and `ancestors` answers `closest()`.
-// Focusing it moves the document's focus there and tells the `focusin` listener, as a browser does.
+// classes it queries. Its attributes and `data-*` come from its start tag, and `ancestors` answers `closest()`, each
+// one looked up when asked, since a repaint may have replaced it since. Focusing it moves the document's focus there
+// and tells the `focusin` listener, as a browser does, and disabling it drops that focus to <body>, as Chrome does.
+// A dialog opens with `showModal()` and fires `close` when closed, synchronously here where a browser queues it.
 const fakeElement = (page, attributes, ancestors = {}) => {
   const attributeValues = new Map(Object.entries(attributes));
   const classes = new Set((attributes.class ?? "").split(/\s+/).filter(Boolean));
+  let disabled = attributeValues.has("disabled");
   const element = {
     id: attributes.id ?? "", value: attributes.value ?? "", textContent: "", removed: false, focusCalls: [],
+    hidden: attributeValues.has("hidden"), isConnected: true,
+    get disabled() { return disabled; },
+    set disabled(value) {
+      disabled = Boolean(value);
+      if (disabled && page.document.activeElement === element) page.document.activeElement = page.document.body;
+    },
     dataset: Object.fromEntries(Object.entries(attributes)
       .filter(([name]) => name.startsWith("data-"))
       .map(([name, value]) => [name.slice(5).replace(/-(\w)/g, (_, letter) => letter.toUpperCase()), value])),
@@ -472,12 +489,20 @@ const fakeElement = (page, attributes, ancestors = {}) => {
         return force;
       },
     },
-    matches: (selector) => selector.split(",").some((part) => part.trim() === `#${element.id}`),
-    closest: (selector) => ancestors[selector] ?? null,
+    // `#id`, `.class` and `[attribute]`, the selectors the module asks an element whether it matches.
+    matches: (selector) => selector.split(",").map((part) => part.trim()).some((part) => part === `#${element.id}`
+      || (part.startsWith(".") && classes.has(part.slice(1)))
+      || (/^\[[\w-]+\]$/.test(part) && attributeValues.has(part.slice(1, -1)))),
+    closest: (selector) => (element.isConnected ? ancestors[selector]?.() : null) ?? null,
     focus(options) {
       element.focusCalls.push(options);
       page.document.activeElement = element;
       page.documentHandlers.get("focusin")?.({ target: element });
+    },
+    showModal() { attributeValues.set("open", ""); },
+    close() {
+      if (!attributeValues.delete("open")) return;
+      page.handlers.get("close")?.({ target: element });
     },
     remove() { element.removed = true; },
     scrollIntoView() {},
@@ -485,35 +510,77 @@ const fakeElement = (page, attributes, ancestors = {}) => {
   return element;
 };
 
+// Where in a painted page the markup at an index sits: in the header, in one of the content's parts, by its index (see
+// PART_BREAK), or in the shell around them.
+const regionsOf = (markup) => {
+  const headerEnd = markup.indexOf("</header>");
+  const breaks = [];
+  for (let at = markup.indexOf(PART_BREAK); at >= 0; at = markup.indexOf(PART_BREAK, at + 1)) breaks.push(at);
+  return (index) => {
+    if (index < headerEnd) return "header";
+    const part = breaks.findIndex((start, at) => index > start && index < breaks[at + 1]);
+    return part < 0 ? "shell" : part;
+  };
+};
+
 // The stand-ins for freshly painted markup: one for each element with an `id`, plus the account menu, the account
-// message and the job name search, which have none. Whatever sits inside that search finds it, and the page's scroll
-// box, with `closest()`; both report the box `page.layout` gives them.
-const paintElements = (page, markup) => {
+// message, the action message and the job name search, which have none, each noted in `page.regions` by the region it
+// sits in. Whatever sits inside that search finds it, and the page's scroll box, with `closest()`; both report the box
+// `page.layout` gives them. Whatever sits inside a part finds it with `closest(".page-content > *")`, and a pager
+// button its table's frame and its sibling.
+const paintElements = (page, markup, regionAt) => {
   page.elements = new Map();
   page.menu = null;
   page.accountMessage = null;
+  page.actionMessage = null;
   page.search = null;
   const searchStart = markup.indexOf('<form class="search-filter job-name-search"');
   const searchEnd = searchStart < 0 ? -1 : markup.indexOf("</form>", searchStart);
+  // Whatever sits inside a <dialog> finds it with `closest("dialog")`, as the dialog's Cancel does.
+  const dialogs = [...markup.matchAll(/<dialog\s[^>]*?id="([^"]+)"/g)].map((match) => ({
+    id: match[1], start: match.index, end: markup.indexOf("</dialog>", match.index),
+  }));
   for (const { 1: source, index } of markup.matchAll(/<[a-z]+\s([^>]*)>/g)) {
     const attributes = Object.fromEntries(
       [...source.matchAll(/([\w-]+)(?:="([^"]*)")?/g)].map(([, name, value = ""]) => [name, value]),
     );
+    const region = regionAt(index);
+    const ancestors = typeof region === "number" ? { ".page-content > *": () => page.parts[region] } : {};
     const classes = (attributes.class ?? "").split(/\s+/);
+    const single = (key, element) => {
+      page[key] = element;
+      page.regions.set(key, region);
+      return element;
+    };
     if (classes.includes("job-name-search")) {
-      page.search = fakeElement(page, attributes);
-      page.search.getBoundingClientRect = () => page.layout.search;
+      single("search", fakeElement(page, attributes, ancestors)).getBoundingClientRect = () => page.layout.search;
     } else if (classes.includes("account-menu")) {
-      page.menu = fakeElement(page, attributes);
+      single("menu", fakeElement(page, attributes));
     } else if (classes.includes("account-message")) {
-      page.accountMessage = fakeElement(page, attributes);
-      page.accountMessage.replaceWith = (node) => { page.accountMessage = node; };
+      single("accountMessage", fakeElement(page, attributes)).replaceWith = (node) => { page.accountMessage = node; };
+    } else if (classes.includes("action-message")) {
+      const message = single("actionMessage", fakeElement(page, attributes, ancestors));
+      const text = { textContent: "" };
+      message.querySelector = (selector) => (selector === ".action-message-text" ? text : null);
+      message.replaceWith = (node) => { page.actionMessage = node; };
     }
     if (attributes.id === undefined) continue;
-    const inSearch = index > searchStart && index < searchEnd;
-    page.elements.set(attributes.id, fakeElement(page, attributes, inSearch
-      ? { ".job-name-search": page.search, ".page-content": page.scroller("page") }
-      : {}));
+    if (index > searchStart && index < searchEnd) {
+      Object.assign(ancestors, { ".job-name-search": () => page.search, ".page-content": () => page.scroller("page") });
+    }
+    const dialog = dialogs.find(({ start, end }) => index > start && index < end);
+    if (dialog) ancestors.dialog = () => page.elements.get(dialog.id);
+    const pager = attributes["data-pager"];
+    if (pager !== undefined) {
+      const sibling = (selector) => (selector === "button:not(:disabled)"
+        ? ["prev", "next"].map((step) => page.element(`pager-${pager}-${step}`))
+          .find((button) => button && !button.disabled) ?? null
+        : null);
+      ancestors[".pager-controls"] = () => ({ querySelector: sibling });
+      if (pager === "jobs" || pager === "crons") ancestors[".table-frame"] = () => page.jobsFrame;
+    }
+    page.elements.set(attributes.id, fakeElement(page, attributes, ancestors));
+    page.regions.set(`#${attributes.id}`, region);
   }
   const list = page.elements.get("job-name-suggestions");
   if (list) Object.defineProperty(list, "offsetHeight", { get: () => page.layout.list });
@@ -523,14 +590,21 @@ const paintElements = (page, markup) => {
 // Every paint gives `#app` a fresh element for each `data-scroll-key` and refresh notice in the markup, the way a real
 // repaint replaces them, and the stand-ins `paintElements` makes; `page.poll` is the 5s refresh, and `page.runTimers`
 // fires whatever `setTimeout` is waiting on, such as the search box's debounce. Back and Forward set `page.location`,
-// then run the `popstate` handler, as a browser does.
+// then run the `popstate` handler, as a browser does. A repaint that keeps the header (`page.header`, which the module
+// finds as `.app-header`) rebuilds only what follows it, so the header's stand-ins, menu, message and notice survive,
+// and one that keeps the content too replaces only the parts it sets `outerHTML` on (`page.parts`, the children of
+// `.page-content`), so the stand-ins of every other part survive as well. `page.paints` counts paints, not parts.
 const bootDashboard = async (t, { tag, path, fetch, root = "", selection = null, auth = false }) => {
-  const location = { pathname: path };
+  // `assigned` collects every URL the page sends the browser to with `location.assign`.
+  const location = { pathname: path, assign: (url) => page.assigned.push(url) };
   let timerId = 0;
   const page = {
-    markup: "", paints: 0, scrollers: [], notice: null, poll: null, location,
+    markup: "", headerMarkup: "", paints: 0, pushes: 0, scrollers: [], notice: null, jobsFrame: null, poll: null,
+    location, assigned: [], parts: [], regions: new Map(), replacing: false,
     handlers: new Map(), documentHandlers: new Map(), windowHandlers: new Map(), timers: new Map(),
-    elements: new Map(), menu: null, accountMessage: null, search: null,
+    elements: new Map(), menu: null, accountMessage: null, actionMessage: null, search: null,
+    // The live region index.html keeps outside #app.
+    announcer: { textContent: "" },
     // Where the page's scroll box, the job name search and its suggestion list sit, in pixels; a tall screen at first.
     layout: { port: { top: 0, bottom: 1000 }, search: { top: 100, bottom: 136 }, list: 200 },
     scroller: (key) => page.scrollers.find((element) => element.dataset.scrollKey === key),
@@ -548,26 +622,121 @@ const bootDashboard = async (t, { tag, path, fetch, root = "", selection = null,
       for (const callback of due) callback();
     },
   };
-  const app = {
-    get innerHTML() { return page.markup; },
-    set innerHTML(value) {
-      page.markup = value;
-      page.paints += 1;
-      page.scrollers = [...value.matchAll(/data-scroll-key="([^"]*)"/g)].map(([, scrollKey]) => ({
+  // An element the module only ever marks with attributes, such as `aria-busy`.
+  const marked = (extra = {}) => ({
+    attributes: new Map(),
+    setAttribute(name, attributeValue) { this.attributes.set(name, String(attributeValue)); },
+    removeAttribute(name) { this.attributes.delete(name); },
+    getAttribute(name) { return this.attributes.get(name) ?? null; },
+    ...extra,
+  });
+  // What a paint of `value` gives `#app`: fresh stand-ins, except in the regions `kept` names (see regionsOf), which
+  // the paint left in place, so that what sits there is what sat there before.
+  const paintPage = (value, kept = () => false) => {
+    const before = { ...page, elements: page.elements, regions: page.regions };
+    const regionAt = regionsOf(value);
+    page.markup = value;
+    page.regions = new Map();
+    page.parts = value.split(PART_BREAK).slice(1, -1).map((_, index) => (kept(index) ? before.parts[index] : {
+      set outerHTML(markup) {
+        const pieces = page.markup.split(PART_BREAK);
+        pieces[index + 1] = markup;
+        // One paint replaces as many parts as changed, synchronously.
+        if (!page.replacing) {
+          page.paints += 1;
+          page.replacing = true;
+          queueMicrotask(() => { page.replacing = false; });
+        }
+        paintPage(pieces.join(PART_BREAK), (region) => region !== index);
+      },
+    }));
+    page.scrollers = [...value.matchAll(/data-scroll-key="([^"]*)"/g)].map(({ 1: scrollKey, index }) => {
+      page.regions.set(`scroll:${scrollKey}`, regionAt(index));
+      const scroller = marked({
         dataset: { scrollKey }, scrollLeft: 0, scrollTop: 0, focusCalls: [],
         focus(options) { this.focusCalls.push(options); },
         ...(scrollKey === "page" ? { getBoundingClientRect: () => page.layout.port } : {}),
-      }));
-      page.notice = value.includes('class="refresh-error"') ? { hidden: true, textContent: "", title: "" } : null;
-      paintElements(page, value);
+      });
+      if (scrollKey === "page") Object.defineProperty(scroller, "children", { get: () => page.parts });
+      return scroller;
+    });
+    const jobsAt = value.indexOf('class="jobs-section"');
+    page.jobsFrame = null;
+    if (jobsAt >= 0) {
+      const jobsRegion = regionAt(jobsAt);
+      page.jobsFrame = marked({ closest: (selector) => (selector === ".page-content > *" ? page.parts[jobsRegion] : null) });
+      page.regions.set("jobsFrame", jobsRegion);
+    }
+    const noticeAt = value.indexOf('class="refresh-error"');
+    page.notice = noticeAt < 0 ? null : { hidden: true, textContent: "", title: "" };
+    if (noticeAt >= 0) page.regions.set("notice", regionAt(noticeAt));
+    paintElements(page, value, regionAt);
+    // What sits in a kept region is what sat there before; anything else from before has left the document.
+    const carried = (key) => {
+      const region = page.regions.get(key);
+      return region !== undefined && kept(region) && before.regions.get(key) === region;
+    };
+    for (const [id, element] of before.elements) {
+      if (carried(`#${id}`)) {
+        page.elements.set(id, element);
+      } else {
+        element.isConnected = false;
+        if (page.document.activeElement === element) page.document.activeElement = page.document.body;
+      }
+    }
+    page.scrollers = page.scrollers.map((scroller) => (carried(`scroll:${scroller.dataset.scrollKey}`)
+      ? before.scrollers.find(({ dataset }) => dataset.scrollKey === scroller.dataset.scrollKey)
+      : scroller));
+    for (const key of ["jobsFrame", "notice", "menu", "accountMessage", "actionMessage", "search"]) {
+      if (carried(key)) page[key] = before[key];
+    }
+  };
+  // The header, which a repaint keeps when its markup is unchanged: what follows it goes, and the new markup is added
+  // after it, while every stand-in inside it carries over.
+  page.header = {
+    attached: false,
+    get nextSibling() {
+      return this.attached ? { remove: () => { this.attached = false; } } : null;
+    },
+    insertAdjacentHTML(position, value) {
+      assert.equal(position, "afterend");
+      page.paints += 1;
+      paintPage(page.headerMarkup + value, (region) => region === "header");
+      this.attached = true;
+    },
+  };
+  const app = {
+    get innerHTML() { return page.markup; },
+    set innerHTML(value) {
+      const end = value.indexOf("</header>");
+      page.headerMarkup = end < 0 ? "" : value.slice(0, end + "</header>".length);
+      page.header.attached = end >= 0;
+      page.paints += 1;
+      paintPage(value);
     },
     addEventListener: (kind, handler) => page.handlers.set(kind, handler),
     contains: (node) => page.scrollers.includes(node) || (node != null && node === selection?.anchorNode),
     querySelector: (selector) => {
+      if (selector === ".app-header") return page.headerMarkup ? page.header : null;
+      if (selector === ".jobs-section .table-frame") return page.jobsFrame;
       if (selector === ".refresh-error") return page.notice;
       if (selector === ".account-menu") return page.menu;
       if (selector === ".account-menu[open]") return page.menu?.hasAttribute("open") ? page.menu : null;
       if (selector === ".account-message") return page.accountMessage;
+      if (selector === ".action-message") return page.actionMessage;
+      if (selector === ".action-message:not([hidden])") return page.actionMessage?.hidden ? null : page.actionMessage;
+      if (selector === ".action-message:not([hidden]) button") {
+        return page.actionMessage && !page.actionMessage.hidden ? page.element("action-message-dismiss") : null;
+      }
+      if (selector === ".page-content") return page.scroller("page") ?? null;
+      if (selector === ".app-dialog[open]") {
+        return [...page.elements.values()].find((element) =>
+          element.classList.contains("app-dialog") && element.hasAttribute("open")) ?? null;
+      }
+      if (/^#[\w-]+(\[open\])?$/.test(selector)) {
+        const element = page.element(selector.slice(1).replace("[open]", ""));
+        return element && (!selector.endsWith("[open]") || element.hasAttribute("open")) ? element : null;
+      }
       if (selector === ".job-name-search input[role=combobox]") {
         return page.element("job-name-filter") ?? page.element("cron-name-filter") ?? null;
       }
@@ -581,6 +750,9 @@ const bootDashboard = async (t, { tag, path, fetch, root = "", selection = null,
     querySelectorAll: (selector) => {
       if (selector === "[data-scroll-key]") return page.scrollers;
       if (selector === ".name-suggestions [role=option]") return page.options();
+      if (selector === "button[data-action]") {
+        return [...page.elements.values()].filter((element) => element.dataset.action !== undefined);
+      }
       return [];
     },
   };
@@ -590,17 +762,23 @@ const bootDashboard = async (t, { tag, path, fetch, root = "", selection = null,
       if (selector === 'meta[name="pgqueue-auth-enabled"]') return { content: String(auth) };
       return null;
     },
-    getElementById: (id) => (id === "app" ? app : page.element(id) ?? null),
+    getElementById: (id) => {
+      if (id === "app") return app;
+      if (id === "announcer") return page.announcer;
+      return page.element(id) ?? null;
+    },
     addEventListener: (kind, handler) => page.documentHandlers.set(kind, handler),
     activeElement: null,
+    body: { id: "" },
     visibilityState: "visible",
     getSelection: () => selection,
+    title: "PGQueue",
   };
   const globals = {
     document: page.document,
     location,
     window: { location, addEventListener: (kind, handler) => page.windowHandlers.set(kind, handler) },
-    history: { pushState: (_, __, url) => { location.pathname = url; } },
+    history: { pushState: (_, __, url) => { page.pushes += 1; location.pathname = url; } },
     setInterval: (callback) => { page.poll = callback; return 0; },
     setTimeout: (callback) => {
       page.timers.set(++timerId, callback);
@@ -624,7 +802,12 @@ const bootDashboard = async (t, { tag, path, fetch, root = "", selection = null,
 
 // A click on a control the handler finds by `selector`, the way `closest()` finds it from the clicked node.
 const clickOn = (page, selector, dataset) => {
-  const node = { dataset, disabled: false, isConnected: true };
+  const attributes = new Map();
+  const node = {
+    dataset, disabled: false, isConnected: true,
+    getAttribute: (name) => attributes.get(name) ?? null,
+    setAttribute: (name, value) => { attributes.set(name, String(value)); },
+  };
   node.closest = (wanted) => (wanted === selector ? node : null);
   return page.handlers.get("click")({ target: node, preventDefault() {} });
 };
@@ -1072,9 +1255,10 @@ test("an applied Abort repaints the job even with text selected on the page", as
     },
   });
   assert.match(page.markup, /<span class="status queued">/);
-  // The copy this deferral exists for: part of the payload, selected, then Abort.
+  // The copy this deferral exists for: part of the payload, selected, then Abort, confirmed.
   selection.isCollapsed = false;
   await clickOn(page, "button[data-action]", { action: "abort" });
+  await clickOn(page, "button[data-confirm-abort]", {});
   await settle();
   assert.match(page.markup, /<span class="status aborted">/, "the aborted job still showed as queued");
   assert.match(page.markup, /id="action-retry" data-action="retry" >Retry/);
@@ -1255,4 +1439,660 @@ test("no media query decides which way the name suggestions open", async () => {
     }
   }
   assert.match(stylesheet, /\n\.name-suggestions\.above\s*\{[^}]*\bbottom:/, "no rule turns the list up");
+});
+
+// A click on `element`, which the handler finds from the clicked node by `selector`, as `closest()` would.
+const clickElement = (page, element, selector) => page.handlers.get("click")({
+  target: { closest: (wanted) => (wanted === selector ? element : null) },
+  button: 0,
+  preventDefault() {},
+});
+
+// A job's detail response, with the fields every view reads.
+const jobBody = (id, fields = {}) => jsonResponse({ job: {
+  id, queue: "main", name: "test", kind: "job", status: "failed", attempts: 1, max_attempts: 1, priority: 0, ...fields,
+} });
+
+test("server strings reach the page as text, never as markup", async (t) => {
+  const hostile = `<img src=x onerror=alert(1)>"'&`;
+  const escaped = "&lt;img src=x onerror=alert(1)&gt;&quot;&#39;&amp;";
+  const id = "99999999-9999-9999-9999-999999999999";
+  // Every string the job page prints: the crumbs take the queue from the URL, the rows take the rest from the server.
+  const detail = await bootDashboard(t, {
+    tag: "hostile-detail-test",
+    path: `/queues/${encodeURIComponent(hostile)}/jobs/${id}`,
+    fetch: async () => jobBody(id, {
+      queue: hostile, name: hostile, kind: "cron", cron_expr: hostile, dedupe_key: hostile, worker_id: hostile,
+      error: hostile, payload: { [hostile]: hostile }, result: hostile, meta: [hostile],
+    }),
+  });
+  assert.match(detail.markup, new RegExp(`<h2>Cron ${id}</h2>`), "the job page did not render");
+  assert.doesNotMatch(detail.markup, /<img src=x/);
+  assert.ok(detail.markup.split(escaped).length - 1 >= 7, "a field was dropped rather than escaped");
+  assert.equal(detail.document.title, `Cron ${id} | PGQueue`);
+
+  // And every string a listing prints: queue, worker and job names, worker stats, a status the server never sends.
+  const listing = await bootDashboard(t, {
+    tag: "hostile-listing-test",
+    path: `/queues/${encodeURIComponent(hostile)}`,
+    fetch: async (url) => jsonResponse(url.includes("/workers?")
+      ? { workers: [{ id: hostile, stats: { complete: hostile, uptime_ms: hostile } }] }
+      : { jobs: [{ ...queueJobs(1)[0], name: hostile, status: hostile }] }),
+  });
+  assert.match(listing.markup, /class="page-content queue-page"/, "the queue page did not render");
+  assert.doesNotMatch(listing.markup, /<img src=x/);
+  const home = await bootDashboard(t, {
+    tag: "hostile-home-test",
+    path: "/",
+    fetch: async () => jsonResponse({ queues: [{ name: hostile, execution: hostile, has_live_workers: false }] }),
+  });
+  assert.match(home.markup, /class="page-content home-page"/, "the home page did not render");
+  assert.doesNotMatch(home.markup, /<img src=x/);
+});
+
+test("a 401 sends the browser to sign in only when the dashboard has its own login", async (t) => {
+  await t.test("built-in login", async (t) => {
+    const page = await bootDashboard(t, {
+      tag: "unauthorized-auth-test", root: "/admin", path: "/admin", auth: true,
+      fetch: async () => failedResponse(401, "unauthorized"),
+    });
+    assert.deepEqual(page.assigned, ["/admin/login"]);
+    assert.equal(page.paints, 0, "the page painted on, under a redirect already under way");
+  });
+  // Without built-in login the 401 came from the application's own middleware, which a redirect loop would never get
+  // past: it fails like any other final answer.
+  await t.test("the application's own auth", async (t) => {
+    const page = await bootDashboard(t, {
+      tag: "unauthorized-no-auth-test", path: "/queues/main", auth: false,
+      fetch: async () => failedResponse(401, "unauthorized"),
+    });
+    assert.deepEqual(page.assigned, []);
+    assert.match(page.markup, /<article class="error-banner">unauthorized<\/article>/);
+    assert.equal(page.document.title, "Error | PGQueue");
+  });
+});
+
+test("a retry that creates a new job opens it", async (t) => {
+  const id = "aaaaaaaa-0000-7000-8000-000000000001";
+  const newId = "aaaaaaaa-0000-7000-8000-000000000002";
+  const posts = [];
+  const page = await bootDashboard(t, {
+    tag: "retry-navigates-test",
+    path: `/queues/main/jobs/${id}`,
+    fetch: async (url, options = {}) => {
+      if (options.method === "POST") {
+        posts.push(url);
+        return jsonResponse({ retried: true, job_id: newId });
+      }
+      const jobId = url.split("/").at(-1);
+      return jobBody(jobId, { status: jobId === id ? "failed" : "queued" });
+    },
+  });
+  await clickElement(page, page.element("action-retry"), "button[data-action]");
+  await settle();
+  assert.deepEqual(posts, [`/api/queues/main/jobs/${id}/retry`]);
+  assert.equal(page.location.pathname, `/queues/main/jobs/${newId}`);
+  assert.match(page.markup, new RegExp(`<h2>Job ${newId}</h2>`));
+  assert.equal(page.document.title, `Job ${newId} | PGQueue`);
+});
+
+for (const [kind, answer, message] of [
+  ["retry", { retried: false, job_id: null }, /^This job was not retried: /],
+  ["abort", { aborted: false }, /^This job was not aborted: /],
+]) {
+  test(`a declined ${kind} says why, on the page and out loud, and leaves focus on the page's crumb`, async (t) => {
+    const id = "bbbbbbbb-0000-7000-8000-000000000001";
+    const page = await bootDashboard(t, {
+      tag: `declined-${kind}-test`,
+      path: `/queues/main/jobs/${id}`,
+      fetch: async (url, options = {}) => (options.method === "POST"
+        ? jsonResponse(answer)
+        : jobBody(id, { status: kind === "retry" ? "failed" : "running" })),
+    });
+    const button = page.element(`action-${kind}`);
+    button.focus();
+    await clickElement(page, button, "button[data-action]");
+    if (kind === "abort") await clickElement(page, page.element("abort-confirm"), "button[data-confirm-abort]");
+    await settle();
+    assert.equal(page.actionMessage.hidden, false, "the refusal left no message");
+    assert.equal(page.actionMessage.classList.contains("error"), true);
+    assert.match(page.actionMessage.querySelector(".action-message-text").textContent, message);
+    page.runTimers();
+    assert.match(page.announcer.textContent, message, "the refusal was not read out");
+    // The post disabled the button, and focus fell from there to nothing. The crumb takes it, in the header a repaint
+    // keeps, rather than Dismiss, which every repaint of the page around the message took focus from and gave back.
+    assert.equal(page.document.activeElement?.id, "breadcrumb-current");
+  });
+}
+
+test("Abort asks first: cancelling posts nothing and hands focus back, confirming posts once", async (t) => {
+  const id = "cccccccc-0000-7000-8000-000000000001";
+  const posts = [];
+  let status = "running";
+  const page = await bootDashboard(t, {
+    tag: "abort-confirmation-test",
+    path: `/queues/main/jobs/${id}`,
+    fetch: async (url, options = {}) => {
+      if (options.method === "POST") {
+        posts.push(url);
+        status = "aborting";
+        return jsonResponse({ aborted: true });
+      }
+      return jobBody(id, { status, max_attempts: 3 });
+    },
+  });
+  const abort = page.element("action-abort");
+  const dialog = page.element("abort-dialog");
+  abort.focus();
+  await clickElement(page, abort, "button[data-action]");
+  assert.equal(dialog.hasAttribute("open"), true, "Abort posted without asking");
+  assert.deepEqual(posts, []);
+  // A poll waits while the question is open, as it does for the password form.
+  page.poll();
+  await settle();
+  assert.equal(page.paints, 1, "a poll repainted the page under the open question");
+
+  await clickElement(page, page.element("abort-cancel"), "button[data-close-dialog]");
+  assert.equal(dialog.hasAttribute("open"), false);
+  assert.deepEqual(posts, [], "Cancel aborted the job");
+  assert.equal(page.document.activeElement, abort, "focus did not go back to Abort");
+
+  await clickElement(page, abort, "button[data-action]");
+  await clickElement(page, page.element("abort-confirm"), "button[data-confirm-abort]");
+  await settle();
+  assert.deepEqual(posts, [`/api/queues/main/jobs/${id}/abort`]);
+  assert.match(page.markup, /<span class="status aborting">/);
+  assert.equal(page.actionMessage.hidden, false);
+  assert.equal(page.actionMessage.classList.contains("error"), false);
+  assert.equal(page.actionMessage.querySelector(".action-message-text").textContent, "Abort requested.");
+  page.runTimers();
+  assert.equal(page.announcer.textContent, "Abort requested.");
+  // Never Retry, where the next Enter would run the job again.
+  assert.equal(page.document.activeElement?.id, "breadcrumb-current");
+});
+
+test("typing in the job name search keeps the page of jobs until the committed filter changes", async (t) => {
+  const requests = [];
+  const page = await bootDashboard(t, {
+    tag: "search-keeps-page-test",
+    path: "/queues/main",
+    fetch: async (url) => {
+      requests.push(url);
+      if (url.includes("/job-names?")) return jsonResponse({ names: ["email"] });
+      if (url.includes("/workers?")) return jsonResponse({ workers: [] });
+      const second = new URL(url, "http://localhost").searchParams.has("cursor_id");
+      const jobs = queueJobs(25, second ? 25 : 0);
+      return jsonResponse({
+        jobs, next_cursor: second ? null : { enqueued_at: "2026-01-01T00:00:00Z", id: jobs.at(-1).id },
+      });
+    },
+  });
+  await clickOn(page, "button[data-page]", { pager: "jobs", page: "1" });
+  await settle();
+  assert.match(page.markup, /Showing 26-50/);
+
+  // Looking at suggestions filters nothing, so the listing stays on page 2.
+  typeName(page, "e");
+  await settle();
+  page.poll();
+  await settle();
+  assert.ok(lastListing(requests).searchParams.has("cursor_id"), "a keystroke threw the listing back to page 1");
+  assert.match(page.markup, /Showing 26-50/);
+
+  // A committed filter is a new listing, and so is a keystroke that drops it.
+  await page.handlers.get("submit")({
+    target: {
+      matches: (selector) => [".search-filter", ".job-name-search"].includes(selector),
+      dataset: { entryKind: "job" },
+    },
+    preventDefault() {},
+  });
+  await settle();
+  assert.equal(lastListing(requests).searchParams.get("name"), "e");
+  assert.equal(lastListing(requests).searchParams.has("cursor_id"), false);
+  await clickOn(page, "button[data-page]", { pager: "jobs", page: "1" });
+  await settle();
+  assert.ok(lastListing(requests).searchParams.has("cursor_id"));
+  typeName(page, "ex");
+  await settle();
+  assert.equal(lastListing(requests).searchParams.has("name"), false);
+  assert.equal(lastListing(requests).searchParams.has("cursor_id"), false, "the dropped filter kept its page");
+});
+
+test("each page names itself in the tab's title", async (t) => {
+  const id = "dddddddd-0000-7000-8000-000000000001";
+  const missing = "dddddddd-0000-7000-8000-000000000002";
+  const page = await bootDashboard(t, {
+    tag: "document-title-test",
+    path: "/",
+    fetch: async (url) => {
+      if (url.endsWith("/api/queues")) return jsonResponse({ queues: [{ name: "main", execution: "idle" }] });
+      if (url.includes("/workers?")) return jsonResponse({ workers: [] });
+      if (url.includes("/jobs?")) return jsonResponse({ jobs: queueJobs(1) });
+      return url.endsWith(missing) ? failedResponse(404, "job not found") : jobBody(id);
+    },
+  });
+  const visit = async (path) => {
+    page.location.pathname = path;
+    page.windowHandlers.get("popstate")();
+    await settle();
+  };
+  assert.equal(page.document.title, "PGQueue");
+  await visit("/queues/main");
+  assert.equal(page.document.title, "Queue main | PGQueue");
+  await visit(`/queues/main/jobs/${id}`);
+  assert.equal(page.document.title, `Job ${id} | PGQueue`);
+  await visit(`/queues/main/jobs/${missing}`);
+  assert.equal(page.document.title, "Error | PGQueue");
+});
+
+test("a navigation hands focus to the new page's crumb, and says the page's name where focus stays put", async (t) => {
+  const jobs = queueJobs(2);
+  const page = await bootDashboard(t, {
+    tag: "navigation-focus-test",
+    path: "/queues/main",
+    auth: true,
+    fetch: async (url) => {
+      if (url.includes("/workers?")) return jsonResponse({ workers: [] });
+      if (url.includes("/jobs?")) return jsonResponse({ jobs });
+      return jobBody(jobs.find(({ id }) => url.endsWith(id)).id);
+    },
+  });
+  // A job row, focused and then opened: the row is gone with the page it was on.
+  const row = page.element(`row-entry-${jobs[0].id}`);
+  row.focus();
+  await clickElement(page, row, "tr[data-row-nav]");
+  await settle();
+  assert.match(page.markup, new RegExp(`<h2>Job ${jobs[0].id}</h2>`));
+  const crumb = page.element("breadcrumb-current");
+  assert.equal(page.document.activeElement, crumb, "focus fell to <body>");
+  assert.equal(crumb.getAttribute("tabindex"), "-1");
+  page.runTimers();
+  assert.equal(page.announcer.textContent, "", "the crumb taking focus is read out already");
+
+  // Back, with focus on the account menu, which the next page has too: focus stays there, so the announcer speaks.
+  page.element("account-summary").focus();
+  page.location.pathname = "/queues/main";
+  page.windowHandlers.get("popstate")();
+  await settle();
+  assert.equal(page.document.activeElement, page.element("account-summary"));
+  page.runTimers();
+  assert.equal(page.announcer.textContent, "Queue main");
+});
+
+test("a navigation marks the page it leaves busy and refuses its actions until a page paints", async (t) => {
+  const firstId = "eeeeeeee-0000-7000-8000-000000000001";
+  const secondId = "eeeeeeee-0000-7000-8000-000000000002";
+  const posts = [];
+  let firstReads = 0;
+  const page = await bootDashboard(t, {
+    tag: "navigation-busy-test",
+    path: `/queues/main/jobs/${firstId}`,
+    fetch: async (url, options = {}) => {
+      if (options.method === "POST") {
+        posts.push(url);
+        return jsonResponse({ retried: false, job_id: null });
+      }
+      // The second job's read never answers, until leaving its page cancels it.
+      if (url.endsWith(secondId)) {
+        const { signal } = options;
+        return new Promise((_, reject) => signal?.addEventListener("abort", () => reject(signal.reason)));
+      }
+      firstReads += 1;
+      return jobBody(firstId);
+    },
+  });
+  page.location.pathname = `/queues/main/jobs/${secondId}`;
+  page.windowHandlers.get("popstate")();
+  await settle();
+  assert.equal(page.scroller("page").getAttribute("aria-busy"), "true", "the page being left was not marked busy");
+  assert.equal(page.element("action-retry").disabled, true, "Retry looked live on a page it refuses to act on");
+  await clickElement(page, page.element("action-retry"), "button[data-action]");
+  assert.deepEqual(posts, []);
+
+  // Back before the second job answered: the first job's own markup comes back, painted afresh.
+  page.location.pathname = `/queues/main/jobs/${firstId}`;
+  page.windowHandlers.get("popstate")();
+  await settle();
+  assert.equal(firstReads, 2);
+  assert.equal(page.paints, 2, "the page came back still marked busy");
+  assert.equal(page.scroller("page").getAttribute("aria-busy"), null);
+  assert.equal(page.element("action-retry").disabled, false);
+});
+
+test("timestamps name their zone, and cron schedules say they are UTC", async (t) => {
+  let crons = queueJobs(1).map((job) => ({ ...job, cron_expr: "0 9 * * *", scheduled_at: "2026-10-16T09:00:00Z" }));
+  const page = await bootDashboard(t, {
+    tag: "time-zone-test",
+    path: "/queues/main",
+    fetch: async (url) => {
+      if (url.includes("/workers?")) return jsonResponse({ workers: [] });
+      return jsonResponse({ jobs: new URL(url, "http://localhost").searchParams.get("kind") === "cron" ? crons : [] });
+    },
+  });
+  assert.match(page.markup, /<td colspan="6">No jobs found\.<\/td>/);
+  await clickOn(page, "button[data-kind]", { kind: "cron" });
+  await settle();
+  assert.match(page.markup, /id="kind-tab-cron" data-kind="cron" aria-pressed="true"/);
+  assert.match(page.markup, /<th>Schedule \(UTC\)<\/th>/);
+  // Each row is one occurrence, finished ones included, so the column is when it was scheduled, not the next run.
+  assert.doesNotMatch(page.markup, /Next run/);
+  assert.match(
+    page.markup,
+    /<time class="timestamp" datetime="2026-10-16T09:00:00\.000Z" title="[^"]+ time; 2026-10-16 09:00:00 UTC">/,
+  );
+  crons = [];
+  page.poll();
+  await settle();
+  assert.match(page.markup, /<td colspan="7">No cron jobs found\.<\/td>/);
+});
+
+test("a repaint keeps an unchanged header, and with it the focus its crumb holds", async (t) => {
+  let workers = [];
+  const page = await bootDashboard(t, {
+    tag: "kept-header-test",
+    path: "/queues/main",
+    fetch: async (url) => jsonResponse(url.includes("/workers?") ? { workers } : { jobs: queueJobs(2) }),
+  });
+  const crumb = page.element("breadcrumb-current");
+  crumb.focus();
+  workers = [{ id: "worker-1", stats: { complete: 1 } }];
+  page.poll();
+  await settle();
+  assert.match(page.markup, /id="row-worker-worker-1"/, "the poll did not repaint");
+  assert.equal(page.element("breadcrumb-current"), crumb, "the header was rebuilt");
+  assert.equal(page.document.activeElement, crumb);
+  assert.equal(crumb.focusCalls.length, 1, "the repaint focused the crumb again, which a screen reader reads out");
+  page.runTimers();
+  assert.equal(page.announcer.textContent, "", "a repaint of the same page announced it");
+});
+
+test("a filter, the kind switch and a page turn show at once, before their listing lands", async (t) => {
+  const pending = [];
+  const page = await bootDashboard(t, {
+    tag: "listing-pending-test",
+    path: "/queues/main",
+    fetch: async (url) => {
+      if (url.includes("/workers?")) return jsonResponse({ workers: [] });
+      const params = new URL(url, "http://localhost").searchParams;
+      const jobs = queueJobs(25);
+      const body = { jobs, next_cursor: { enqueued_at: "2026-01-01T00:00:00Z", id: jobs.at(-1).id } };
+      if (!params.has("status") && !params.has("cursor_id") && params.get("kind") === "job") return jsonResponse(body);
+      const answer = Promise.withResolvers();
+      pending.push(() => answer.resolve(jsonResponse(body)));
+      return answer.promise;
+    },
+  });
+  const frame = page.jobsFrame;
+  await clickOn(page, "button[data-status]", { entryKind: "job", status: "failed" });
+  assert.equal(page.element("status-filter-job-failed").getAttribute("aria-pressed"), "true");
+  assert.equal(frame.getAttribute("aria-busy"), "true", "the table gave no sign that it was changing");
+  pending.shift()();
+  await settle();
+  assert.equal(page.jobsFrame.getAttribute("aria-busy"), null, "the paint left the table busy");
+
+  await clickOn(page, "button[data-kind]", { kind: "cron" });
+  assert.equal(page.element("kind-tab-cron").getAttribute("aria-pressed"), "true");
+  assert.equal(page.element("kind-tab-job").getAttribute("aria-pressed"), "false");
+  pending.shift()();
+  await settle();
+
+  const next = page.element("pager-crons-next");
+  await clickElement(page, next, "button[data-page]");
+  assert.equal(next.getAttribute("aria-disabled"), "true", "the page turn gave no sign that it was under way");
+  // Refused, or it could page twice before the first page painted.
+  await clickElement(page, next, "button[data-page]");
+  assert.equal(pending.length, 1);
+  pending.shift()();
+  await settle();
+  assert.match(page.markup, /Showing 26-50/);
+});
+
+test("Back to the page being left, when its refresh fails, takes the busy marking away", async (t) => {
+  const firstId = "ffffffff-0000-7000-8000-000000000001";
+  const secondId = "ffffffff-0000-7000-8000-000000000002";
+  let failing = false;
+  const page = await bootDashboard(t, {
+    tag: "navigation-settle-test",
+    path: `/queues/main/jobs/${firstId}`,
+    fetch: async (url, options = {}) => {
+      if (url.endsWith(secondId)) {
+        const { signal } = options;
+        return new Promise((_, reject) => signal?.addEventListener("abort", () => reject(signal.reason)));
+      }
+      return failing ? failedResponse(503, "database unavailable") : jobBody(firstId);
+    },
+  });
+  page.location.pathname = `/queues/main/jobs/${secondId}`;
+  page.windowHandlers.get("popstate")();
+  await settle();
+  assert.equal(page.scroller("page").getAttribute("aria-busy"), "true");
+  failing = true;
+  page.location.pathname = `/queues/main/jobs/${firstId}`;
+  page.windowHandlers.get("popstate")();
+  await settle();
+  assert.equal(page.paints, 1, "a failed refresh replaced the page");
+  assert.equal(page.scroller("page").getAttribute("aria-busy"), null, "the page stayed busy");
+  assert.equal(page.element("action-retry").disabled, false, "Retry stayed off on the page it came back to");
+  assert.equal(page.notice.hidden, false);
+  assert.match(page.notice.textContent, /^Refresh failed: database unavailable/);
+});
+
+test("leaving a job page closes its open Abort question, and posts nothing", async (t) => {
+  const id = "ffffffff-0000-7000-8000-000000000003";
+  const posts = [];
+  const page = await bootDashboard(t, {
+    tag: "navigation-closes-dialog-test",
+    path: `/queues/main/jobs/${id}`,
+    fetch: async (url, options = {}) => {
+      if (options.method === "POST") posts.push(url);
+      if (url.includes("/workers?")) return jsonResponse({ workers: [] });
+      if (url.includes("/jobs?")) return jsonResponse({ jobs: [] });
+      return jobBody(id, { status: "running" });
+    },
+  });
+  const dialog = page.element("abort-dialog");
+  await clickElement(page, page.element("action-abort"), "button[data-action]");
+  assert.equal(dialog.hasAttribute("open"), true);
+  page.location.pathname = "/queues/main";
+  page.windowHandlers.get("popstate")();
+  await settle();
+  assert.equal(dialog.hasAttribute("open"), false, "the question about the old job stayed open over the new page");
+  assert.match(page.markup, /class="page-content queue-page"/, "the open question held the next page back");
+  assert.deepEqual(posts, []);
+});
+
+test("a failed action keeps its button off on a page being left", async (t) => {
+  const firstId = "ffffffff-0000-7000-8000-000000000004";
+  const secondId = "ffffffff-0000-7000-8000-000000000005";
+  const post = Promise.withResolvers();
+  const page = await bootDashboard(t, {
+    tag: "navigation-failed-action-test",
+    path: `/queues/main/jobs/${firstId}`,
+    fetch: async (url, options = {}) => {
+      if (options.method === "POST") return post.promise;
+      if (url.endsWith(secondId)) {
+        const { signal } = options;
+        return new Promise((_, reject) => signal?.addEventListener("abort", () => reject(signal.reason)));
+      }
+      return jobBody(firstId, { status: "running" });
+    },
+  });
+  const abort = page.element("action-abort");
+  await clickElement(page, abort, "button[data-action]");
+  const confirmed = clickElement(page, page.element("abort-confirm"), "button[data-confirm-abort]");
+  await settle();
+  page.location.pathname = `/queues/main/jobs/${secondId}`;
+  page.windowHandlers.get("popstate")();
+  await settle();
+  post.resolve(failedResponse(503, "the job is locked by another transaction; try again"));
+  await confirmed;
+  await settle();
+  assert.equal(abort.disabled, true, "Abort looked live on the page being left, and did nothing when clicked");
+});
+
+test("a double click on a row opens its page once", async (t) => {
+  const jobs = queueJobs(1);
+  const page = await bootDashboard(t, {
+    tag: "double-click-test",
+    path: "/queues/main",
+    fetch: async (url) => {
+      if (url.includes("/workers?")) return jsonResponse({ workers: [] });
+      if (url.includes("/jobs?")) return jsonResponse({ jobs });
+      return jobBody(jobs[0].id);
+    },
+  });
+  const row = page.element(`row-entry-${jobs[0].id}`);
+  await clickElement(page, row, "tr[data-row-nav]");
+  await clickElement(page, row, "tr[data-row-nav]");
+  await settle();
+  assert.equal(page.pushes, 1, "the second click added a history entry Back only repaints");
+  assert.equal(page.location.pathname, `/queues/main/jobs/${jobs[0].id}`);
+});
+
+test("paging with the keyboard keeps focus on the pager, and on its sibling at either end", async (t) => {
+  const page = await bootDashboard(t, {
+    tag: "pager-focus-test",
+    path: "/queues/main",
+    fetch: async (url) => {
+      if (url.includes("/workers?")) return jsonResponse({ workers: [] });
+      const second = new URL(url, "http://localhost").searchParams.has("cursor_id");
+      const jobs = queueJobs(25, second ? 25 : 0);
+      return jsonResponse({
+        jobs, next_cursor: second ? null : { enqueued_at: "2026-01-01T00:00:00Z", id: jobs.at(-1).id },
+      });
+    },
+  });
+  const next = page.element("pager-jobs-next");
+  next.focus();
+  // Enter, and Enter again before the page lands, which turns no second page.
+  void clickElement(page, next, "button[data-page]");
+  assert.equal(page.document.activeElement, next, "the page turn took focus from the button");
+  void clickElement(page, next, "button[data-page]");
+  await settle();
+  assert.match(page.markup, /Showing 26-50/);
+  // The last page has no Next, so Previous takes the paging over, and on the first page Next takes it back.
+  assert.equal(page.document.activeElement?.id, "pager-jobs-prev", "focus fell to <body>");
+  void clickElement(page, page.element("pager-jobs-prev"), "button[data-page]");
+  await settle();
+  assert.match(page.markup, /Showing 1-25/);
+  assert.equal(page.document.activeElement?.id, "pager-jobs-next");
+});
+
+test("a poll that changes only the workers table leaves the jobs section, and the focus in it, alone", async (t) => {
+  const jobs = queueJobs(2);
+  let polls = 0;
+  const page = await bootDashboard(t, {
+    tag: "kept-parts-test",
+    path: "/queues/main",
+    // A live worker's uptime, which changes on every poll.
+    fetch: async (url) => jsonResponse(url.includes("/workers?")
+      ? { workers: [{ id: "worker-1", stats: { complete: 1, uptime_ms: (polls += 1) * 60_000 } }] }
+      : { jobs }),
+  });
+  for (const id of ["status-filter-job-failed", `row-entry-${jobs[0].id}`]) {
+    const control = page.element(id);
+    control.focus();
+    const paints = page.paints;
+    page.poll();
+    await settle();
+    assert.equal(page.paints, paints + 1, "the poll did not repaint");
+    assert.equal(page.element(id), control, `the poll rebuilt the jobs section around ${id}`);
+    assert.equal(page.document.activeElement, control);
+    assert.equal(control.focusCalls.length, 1, "the repaint focused it again, which a screen reader reads out");
+  }
+});
+
+test("a navigation from the job name search, with text selected there, hands focus to the new page's crumb", async (t) => {
+  const page = await bootSearch(t, "search-navigation-focus-test", ["job-1"]);
+  const input = page.element("job-name-filter");
+  input.focus();
+  Object.assign(input, { value: "job", selectionStart: 1, selectionEnd: 3 });
+  page.location.pathname = `/queues/main/jobs/${page.jobs[0].id}`;
+  page.windowHandlers.get("popstate")();
+  await settle();
+  // Restoring the input's selection onto the crumb threw, and the error page took the job's place.
+  assert.match(page.markup, new RegExp(`<h2>Job ${page.jobs[0].id}</h2>`));
+  assert.equal(page.document.activeElement?.id, "breadcrumb-current");
+});
+
+test("the same filter clicked twice before its listing lands leaves no table busy once it does", async (t) => {
+  const pending = [];
+  const page = await bootDashboard(t, {
+    tag: "filter-twice-test",
+    path: "/queues/main",
+    fetch: async (url) => {
+      if (url.includes("/workers?")) return jsonResponse({ workers: [] });
+      const body = { jobs: queueJobs(2) };
+      if (!new URL(url, "http://localhost").searchParams.has("status")) return jsonResponse(body);
+      const answer = Promise.withResolvers();
+      pending.push(() => answer.resolve(jsonResponse(body)));
+      return answer.promise;
+    },
+  });
+  const painted = page.markup;
+  await clickOn(page, "button[data-status]", { entryKind: "job", status: "failed" });
+  await clickOn(page, "button[data-status]", { entryKind: "job", status: "failed" });
+  assert.equal(page.jobsFrame.getAttribute("aria-busy"), "true");
+  pending.shift()();
+  await settle();
+  // The listing came back to the markup on screen, which a paint would skip, or keep the jobs section of.
+  assert.equal(page.markup, painted);
+  assert.equal(page.jobsFrame.getAttribute("aria-busy"), null, "the table stayed busy");
+});
+
+test("a poll that finds the job finished hands the focus on Abort to the page's crumb, never to Retry", async (t) => {
+  const id = "ffffffff-0000-7000-8000-000000000006";
+  let status = "running";
+  const page = await bootDashboard(t, {
+    tag: "finished-abort-focus-test", path: `/queues/main/jobs/${id}`, fetch: async () => jobBody(id, { status }),
+  });
+  page.element("action-abort").focus();
+  status = "complete";
+  page.poll();
+  await settle();
+  assert.match(page.markup, /id="action-abort" data-action="abort" disabled>/);
+  assert.equal(page.document.activeElement?.id, "breadcrumb-current");
+});
+
+test("Dismiss hands its focus to the page's crumb, never to Retry", async (t) => {
+  const id = "ffffffff-0000-7000-8000-000000000007";
+  const page = await bootDashboard(t, {
+    tag: "dismiss-focus-test",
+    path: `/queues/main/jobs/${id}`,
+    fetch: async (url, options = {}) => (options.method === "POST"
+      ? jsonResponse({ retried: false, job_id: null })
+      : jobBody(id)),
+  });
+  await clickElement(page, page.element("action-retry"), "button[data-action]");
+  await settle();
+  assert.equal(page.actionMessage.hidden, false, "the refusal left no message");
+  const dismiss = page.element("action-message-dismiss");
+  dismiss.focus();
+  await clickElement(page, dismiss, "button[data-dismiss-action-message]");
+  assert.equal(page.actionMessage.hidden, true);
+  assert.equal(page.document.activeElement?.id, "breadcrumb-current", "focus stayed on the hidden Dismiss");
+});
+
+test("a job that finishes while its Abort posts gets a live Retry once the abort is declined", async (t) => {
+  const id = "ffffffff-0000-7000-8000-000000000008";
+  let status = "running";
+  const post = Promise.withResolvers();
+  const page = await bootDashboard(t, {
+    tag: "finished-during-abort-test",
+    path: `/queues/main/jobs/${id}`,
+    fetch: async (url, options = {}) => (options.method === "POST" ? post.promise : jobBody(id, { status })),
+  });
+  await clickElement(page, page.element("action-abort"), "button[data-action]");
+  const confirmed = clickElement(page, page.element("abort-confirm"), "button[data-confirm-abort]");
+  await settle();
+  // The job finishes meanwhile, and a poll draws its Retry, kept off while the abort is out.
+  status = "complete";
+  page.poll();
+  await settle();
+  assert.equal(page.element("action-retry").disabled, true, "Retry looked live while the abort was out");
+  post.resolve(jsonResponse({ aborted: false }));
+  await confirmed;
+  await settle();
+  assert.equal(page.element("action-retry").disabled, false, "Retry stayed off with nothing out");
 });

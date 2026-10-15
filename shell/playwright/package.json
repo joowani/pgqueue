@@ -1,0 +1,9 @@
+{
+  "name": "pgqueue-playwright",
+  "private": true,
+  "description": "Playwright for shell/scripts/playwright, which drives the dashboard in the installed Google Chrome.",
+  "type": "module",
+  "devDependencies": {
+    "playwright": "1.64.1"
+  }
+}

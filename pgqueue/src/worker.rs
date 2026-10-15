@@ -561,6 +561,12 @@ pub struct WorkerTimers {
     /// How often in-flight jobs are checked for abort requests. Default 1s.
     pub abort: Duration,
     /// How often cron jobs are (re-)scheduled. Default 1s.
+    ///
+    /// Never slower than a quarter of the shortest misfire grace among the worker's crons (see
+    /// [`CronMisfirePolicy`](crate::CronMisfirePolicy)), down to a tenth of a second, which the worker polls at
+    /// instead, and says so in a warning at startup: an occurrence is published only if its grace, counted from the
+    /// occurrence, has not run out when a pass reaches it, so a slower timer found every occurrence of a minutely cron
+    /// already stale and skipped it, period after period.
     pub schedule: Duration,
     /// How often the sweeper purges expired rows and recovers stuck jobs.
     /// Default 60s. When a sweep fills its configured batch, the worker drains
@@ -730,9 +736,11 @@ impl WorkerBuilder {
     /// behind each other: one that comes due while an earlier occurrence is
     /// still live (queued, running, aborting, or waiting out a retry delay) is
     /// skipped with a warning, and the schedule resumes at the next occurrence
-    /// after the holder finishes. Job execution remains at least once. Manual retries are the
-    /// exception: [`crate::Queue::retry_job`] on a terminal occurrence produces a keyless one-off
-    /// outside the schedule that can run beside a live scheduled occurrence.
+    /// after the holder finishes. Job execution remains at least once. The exceptions are those of
+    /// [`macro@crate::cron`]: a manual [`crate::Queue::retry_job`] of a terminal occurrence, which
+    /// produces a keyless one-off outside the schedule, and a handler that keeps running after its
+    /// attempt ended — one that blocks its thread past its timeout, outlives a shutdown, or whose
+    /// worker's lease stalled — either of which can run beside the next occurrence.
     ///
     /// The cron expression owns every occurrence's run time, so a builder
     /// carrying [`JobBuilder::delay`] or [`JobBuilder::at`] makes `build()`
@@ -859,7 +867,11 @@ impl WorkerBuilder {
         self
     }
 
-    /// Fallback polling interval when notifications are quiet. Default 1s.
+    /// How often an idle worker polls for work. Default 1s.
+    ///
+    /// Notifications wake a worker for work that is due when it is published, but nothing announces work that
+    /// *becomes* due later: a delayed or scheduled job, a retry waiting out its delay, a job a worker without its
+    /// handler handed back. An idle worker finds those only when it polls, so they can start up to this late.
     pub fn poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
@@ -2393,9 +2405,13 @@ async fn fetch_loop(
             // to decide whether it may drain is released.
             let fetched =
                 intake.end_fetch(dequeue.as_mut().map(|batch| std::mem::take(&mut batch.jobs)).unwrap_or_default());
-            if dequeue.is_ok() {
+            if let Ok(batch) = &dequeue {
                 inner.health.recovered(WorkerComponent::Dequeue);
                 failing_since = None;
+                // Failed under this worker's id, so they count in its stats as the queue's.
+                for _ in 0..batch.quarantined {
+                    inner.counters.record_failed();
+                }
             }
             match dequeue {
                 Ok(result) if fetched == 0 && result.intake_open && !result.work_available => {
@@ -2404,6 +2420,15 @@ async fn fetch_loop(
                     intake_closed_since = None;
                     intake.prove_drained(demand_generation);
                     break;
+                }
+                // Every row the claim took was unreadable and failed in its transaction. That emptied the batch the way
+                // lock contention does, and read as contention it backed off to one fetch per poll interval and let a
+                // burst conclude a drain with readable work queued behind the unreadable rows. It is progress instead:
+                // fetch again at once, for the same demand.
+                Ok(result) if fetched == 0 && result.intake_open && result.quarantined > 0 => {
+                    retry_max_ms = DEQUEUE_RETRY_INITIAL_MAX_MS;
+                    unclaimable_since = None;
+                    intake_closed_since = None;
                 }
                 Ok(result) if fetched == 0 && result.intake_open => {
                     // `SKIP LOCKED` can produce an empty batch while a matching
@@ -2634,7 +2659,11 @@ async fn drain_on_shutdown(inner: &Arc<WorkerInner>, intake: &WorkerIntake) {
                 }
                 Ok(false) => true,
                 Err(error) => {
-                    tracing::error!(job.id = %job.id, %error, "failed to finalize aborted buffered job during shutdown");
+                    tracing::error!(
+                        job.id = %job.id,
+                        %error,
+                        "failed to finalize aborted buffered job during shutdown"
+                    );
                     false
                 }
             },
@@ -3407,6 +3436,19 @@ async fn notification_health_loop(
     }
 }
 
+/// The shortest interval the schedule loop may poll at.
+const MIN_SCHEDULE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The interval the schedule loop polls at: `configured`, or a quarter of the tightest misfire grace among `crons` if
+/// that is shorter, so each occurrence meets a pass while it can still be published (see [`WorkerTimers::schedule`]).
+fn schedule_interval(configured: Duration, crons: &[JobCronEntry], now: jiff::Timestamp) -> Duration {
+    crons
+        .iter()
+        .filter_map(|entry| entry.tightest_grace(now))
+        .map(|grace| (grace / 4).max(MIN_SCHEDULE_INTERVAL))
+        .fold(configured, Duration::min)
+}
+
 /// Advances durable cron cursors. Schedule rows are the authority; local
 /// entries only act when their revision and canonical definition still match.
 async fn schedule_loop(
@@ -3415,7 +3457,16 @@ async fn schedule_loop(
     mut holder_warned: HashSet<String>,
     mut state: CronSchedulingState,
 ) {
-    let mut interval = tokio::time::interval(inner.timers.schedule);
+    let period = schedule_interval(inner.timers.schedule, &inner.crons, jiff::Timestamp::now());
+    if period < inner.timers.schedule {
+        tracing::warn!(
+            worker.id = %inner.id,
+            configured = ?inner.timers.schedule,
+            polling = ?period,
+            "the cron schedule timer is slower than a cron's misfire grace allows; polling faster instead"
+        );
+    }
+    let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
@@ -4293,6 +4344,43 @@ mod loop_tests {
 
     fn entry(expr: &str) -> JobCronEntry {
         JobCronEntry::new(expr, crate::job::JobRequest::new("tick", Value::Null)).unwrap()
+    }
+
+    fn entry_with(expr: &str, misfire: crate::CronMisfirePolicy) -> JobCronEntry {
+        let options = CronOptions { misfire, ..CronOptions::default() };
+        JobCronEntry::with_options(expr, crate::job::JobRequest::new("tick", Value::Null), options).unwrap()
+    }
+
+    /// A pass reaches each due cron only once per tick, and an occurrence is publishable only within its grace, so a
+    /// sixty-second timer skipped every occurrence of a minutely cron whose twelve seconds had run out by the time
+    /// the pass came round. The loop polls within a quarter of the tightest grace instead, and keeps the configured
+    /// timer wherever that is already fast enough.
+    #[test]
+    fn test_schedule_interval_polls_within_a_quarter_of_the_tightest_misfire_grace() {
+        let now = at("2026-01-05T10:00:30Z");
+        let minute = Duration::from_secs(60);
+        assert_eq!(schedule_interval(minute, &[entry("* * * * *")], now), Duration::from_secs(3));
+        assert_eq!(
+            schedule_interval(minute, &[entry("0 0 * * *"), entry("*/5 * * * *")], now),
+            Duration::from_secs(15)
+        );
+        assert_eq!(schedule_interval(minute, &[entry("0 0 * * *")], now), minute);
+        assert_eq!(schedule_interval(Duration::from_secs(1), &[entry("* * * * *")], now), Duration::from_secs(1));
+        assert_eq!(schedule_interval(minute, &[], now), minute);
+
+        let fire_once = entry_with("* * * * *", crate::CronMisfirePolicy::FireOnce);
+        assert_eq!(schedule_interval(minute, &[fire_once], now), Duration::from_secs(15));
+        let tight = entry_with("* * * * *", crate::CronMisfirePolicy::Skip { grace: Some(Duration::from_secs(1)) });
+        assert_eq!(schedule_interval(minute, &[tight], now), Duration::from_millis(250));
+        let tighter = entry_with("* * * * *", crate::CronMisfirePolicy::Skip { grace: Some(Duration::from_millis(1)) });
+        assert_eq!(schedule_interval(minute, &[tighter], now), MIN_SCHEDULE_INTERVAL);
+        // An explicit grace bounds even a cron whose occurrences are more than a year apart, which sampling never
+        // reaches, and a schedule that fires only on 29 February is sampled from its next occurrence, however far off.
+        let yearly = entry_with("0 0 1 1 *", crate::CronMisfirePolicy::Skip { grace: Some(Duration::from_secs(30)) });
+        assert_eq!(schedule_interval(minute, &[yearly], now), Duration::from_millis(7_500));
+        let leap = entry_with("0 0 29 2 *", crate::CronMisfirePolicy::Skip { grace: Some(Duration::from_secs(30)) });
+        assert_eq!(schedule_interval(minute, &[leap], now), Duration::from_millis(7_500));
+        assert_eq!(schedule_interval(minute, &[entry("* * 29 2 *")], now), Duration::from_secs(3));
     }
 
     #[test]

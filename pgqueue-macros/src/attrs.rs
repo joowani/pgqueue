@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use cronexpr::{FallbackTimezoneOption, ParseOptions};
 use proc_macro2::{Span, TokenStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -76,6 +77,14 @@ impl AttrMode {
         }
     }
 
+    /// The attribute's path, for errors that point the reader at its documentation.
+    fn attr_path(self) -> &'static str {
+        match self {
+            AttrMode::Job => "pgqueue::job",
+            AttrMode::Cron => "pgqueue::cron",
+        }
+    }
+
     /// The keys this macro accepts, for the unknown-attribute error. Suggesting
     /// `revision` to a `#[pgqueue::job]` would point at a key the very next
     /// check rejects.
@@ -114,6 +123,9 @@ impl JobAttrs {
         let mut attrs = JobAttrs::default();
         if tokens.is_empty() {
             return Ok(attrs);
+        }
+        if let Some(literal) = stray_string(&tokens) {
+            return Err(positional_string_error(&literal, mode));
         }
         let metas = syn::parse::Parser::parse2(Punctuated::<Meta, Token![,]>::parse_terminated, tokens)?;
         let mut seen = HashSet::new();
@@ -197,7 +209,7 @@ impl JobAttrs {
                     }
                 }
                 other => {
-                    return Err(err(other, "expected `key = value`; see the pgqueue::job docs"));
+                    return Err(err(other, &format!("expected `key = value`; see the {} docs", mode.attr_path())));
                 }
             }
         }
@@ -208,6 +220,60 @@ impl JobAttrs {
         }
         Ok(attrs)
     }
+}
+
+/// The first string literal standing alone among the attribute's comma-separated items, if one does, seen through the
+/// invisible group a `macro_rules!` `$name:expr` or `$name:literal` fragment arrives in (see [`ungroup`]). A valid
+/// attribute has none — every item is `key = value` — so any position counts, not only the first. When the items do
+/// not all parse as expressions, as with a missing comma, a leading string is still found.
+fn stray_string(tokens: &TokenStream) -> Option<syn::LitStr> {
+    let string = |expr: &Expr| match ungroup(expr) {
+        Expr::Lit(ExprLit { lit: Lit::Str(literal), .. }) => Some(literal.clone()),
+        _ => None,
+    };
+    if let Ok(items) = syn::parse::Parser::parse2(Punctuated::<Expr, Token![,]>::parse_terminated, tokens.clone()) {
+        return items.iter().find_map(string);
+    }
+    let leading = |input: syn::parse::ParseStream| {
+        let expr = input.parse::<Expr>()?;
+        input.parse::<TokenStream>()?;
+        Ok(string(&expr))
+    };
+    syn::parse::Parser::parse2(leading, tokens.clone()).ok().flatten()
+}
+
+/// The options `#[pgqueue::cron]` parses a schedule with, which the worker uses at runtime too: a schedule without a
+/// time zone is read in UTC.
+pub(crate) fn cron_parse_options() -> ParseOptions {
+    let mut options = ParseOptions::default();
+    options.fallback_timezone_option = FallbackTimezoneOption::UTC;
+    options
+}
+
+/// Whether `schedule` is one `#[pgqueue::cron]` would parse: five whitespace-separated fields the parser accepts.
+fn is_cron_schedule(schedule: &str) -> bool {
+    schedule.split_ascii_whitespace().count() == 5
+        && cronexpr::parse_crontab_with(schedule, cron_parse_options()).is_ok()
+}
+
+/// The error for a string written where a `key = value` belongs. A bare string is the likely guess for a job's name,
+/// by analogy with the cron schedule, which is positional; left to `syn`, it was refused as "expected identifier",
+/// which names neither the key nor the form. On a job, a string that parses as a schedule says the author meant a cron
+/// instead.
+fn positional_string_error(literal: &syn::LitStr, mode: AttrMode) -> syn::Error {
+    let message = match mode {
+        AttrMode::Job if is_cron_schedule(&literal.value()) => format!(
+            "#[pgqueue::job] takes no schedule; for a recurring job, use #[pgqueue::cron({:?})]",
+            literal.value()
+        ),
+        AttrMode::Job => {
+            "expected `key = value`, such as `name = \"...\"`; #[pgqueue::job] takes no positional argument".to_string()
+        }
+        AttrMode::Cron => {
+            "expected `key = value`, such as `name = \"...\"`; only the schedule is positional".to_string()
+        }
+    };
+    syn::Error::new(literal.span(), message)
 }
 
 fn err(spanned: &impl quote::ToTokens, message: &str) -> syn::Error {
@@ -582,6 +648,52 @@ mod tests {
         ] {
             assert!(parse(tokens.clone()).is_err(), "should reject: {tokens}");
         }
+    }
+
+    /// A bare string reads as a positional name, by analogy with the cron schedule, and both attributes say what to
+    /// write instead, each pointing at its own documentation.
+    #[test]
+    fn test_attributes_explain_a_positional_string_and_a_bare_key() {
+        let error = JobAttrs::parse(quote!("send_email"), AttrMode::Job).unwrap_err().to_string();
+        assert!(error.contains("such as `name = \"...\"`; #[pgqueue::job] takes no positional argument"), "{error}");
+        let error = JobAttrs::parse(quote!("hourly", max_attempts = 2), AttrMode::Cron).unwrap_err().to_string();
+        assert!(error.contains("only the schedule is positional"), "{error}");
+        // A `macro_rules!` fragment arrives in an invisible group, which hid the string from a check of the first
+        // token alone and left it to `syn`'s "expected identifier".
+        let grouped = TokenStream::from(proc_macro2::TokenTree::Group(proc_macro2::Group::new(
+            proc_macro2::Delimiter::None,
+            quote!("send_email"),
+        )));
+        let error = JobAttrs::parse(grouped, AttrMode::Job).unwrap_err().to_string();
+        assert!(error.contains("#[pgqueue::job] takes no positional argument"), "{error}");
+        // A schedule given to a job means the author wanted a cron, but five words that are no schedule do not.
+        let error = JobAttrs::parse(quote!("0 * * * *"), AttrMode::Job).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "#[pgqueue::job] takes no schedule; for a recurring job, use #[pgqueue::cron(\"0 * * * *\")]"
+        );
+        let error = JobAttrs::parse(quote!("send the welcome email now"), AttrMode::Job).unwrap_err().to_string();
+        assert!(error.contains("#[pgqueue::job] takes no positional argument"), "{error}");
+        // A string after a valid item is the same mistake, and got only `syn`'s "expected identifier".
+        let error = JobAttrs::parse(quote!(name = "x", "y"), AttrMode::Job).unwrap_err().to_string();
+        assert!(error.contains("#[pgqueue::job] takes no positional argument"), "{error}");
+        let error = JobAttrs::parse(quote!(name = "x", "y"), AttrMode::Cron).unwrap_err().to_string();
+        assert!(error.contains("only the schedule is positional"), "{error}");
+        let error = JobAttrs::parse(quote!("send_email" max_attempts = 2), AttrMode::Job).unwrap_err().to_string();
+        assert!(error.contains("#[pgqueue::job] takes no positional argument"), "{error}");
+        let error = JobAttrs::parse(quote!(name("x")), AttrMode::Cron).unwrap_err().to_string();
+        assert!(error.contains("see the pgqueue::cron docs"), "{error}");
+    }
+
+    /// Both rules refuse at compile time what would otherwise fail at runtime or be read as another key: a NUL in a
+    /// name fails every enqueue (and a cron's worker build) with `Error::Config`, and a path such as `pgqueue::name`
+    /// is not the `name` key.
+    #[test]
+    fn test_attributes_reject_a_nul_in_the_name_and_a_path_key() {
+        let error = parse(quote!(name = "a\0b")).unwrap_err().to_string();
+        assert!(error.contains("contain no NUL"), "{error}");
+        let error = parse(quote!(pgqueue::name = "x")).unwrap_err().to_string();
+        assert!(error.contains("expected a simple attribute name"), "{error}");
     }
 
     /// `syn` folds a leading `-` into the literal only when the literal is the

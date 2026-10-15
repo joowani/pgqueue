@@ -20,6 +20,7 @@ jobs:
   validate:
     name: Validate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -37,6 +38,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          # Every GitHub write goes through `gh` and its token, so no step needs git credentials left on disk.
+          persist-credentials: false
 
       - name: Validate version
         env:
@@ -55,6 +58,8 @@ jobs:
     name: Publish Crates
     needs: check
     runs-on: ubuntu-latest
+    # Covers the packaging and publishing builds and two crates.io index waits of up to five minutes each.
+    timeout-minutes: 30
     environment: crates-io
     permissions:
       contents: write
@@ -74,6 +79,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          # Every GitHub write goes through `gh` and its token, so no step needs git credentials left on disk.
+          persist-credentials: false
 
       - name: Validate version
         env:

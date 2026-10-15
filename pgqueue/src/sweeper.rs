@@ -761,9 +761,9 @@ impl Sweeper {
     ///
     /// The lock is dropped with an explicit unlock before the close, so a peer contending right after this returns can
     /// take it. Closing alone only sends `Terminate`: the server frees the session's locks when its backend exits,
-    /// which can land after a peer's `pg_try_advisory_lock` has already been refused. The unlock is given half a second;
-    /// past that, or if it fails, the close still ends the session and frees the lock. The close is bounded too, past
-    /// which the connection is dropped, which ends the session just the same.
+    /// which can land after a peer's `pg_try_advisory_lock` has already been refused. The unlock is given half a
+    /// second; past that, or if it fails, the close still ends the session and frees the lock. The close is bounded
+    /// too, past which the connection is dropped, which ends the session just the same.
     pub async fn release(&mut self) {
         if let Some(mut conn) = self.conn.take() {
             let unlock = sqlx::query("SELECT pg_advisory_unlock($1)").bind(self.database.sweep_lock_key());

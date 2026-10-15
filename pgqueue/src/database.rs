@@ -77,7 +77,121 @@ struct DatabaseServer {
 
 enum MigrationStatus {
     Current,
-    Pending,
+    /// Something is left to apply. `repair_v0_1` says the history records version 1 as pgqueue 0.1.0 shipped it, so
+    /// [`repair_v0_1_schema`] must run before the migrator, which would otherwise refuse that version as changed.
+    Pending {
+        repair_v0_1: bool,
+    },
+}
+
+/// SHA-384 of migration 1 as pgqueue 0.1.0 shipped it.
+///
+/// 0.2.0 edited that migration in place instead of adding a second one: it added `jobs.refunds` with its range check
+/// and rewrote the two dashboard page functions. A database that 0.1.0 migrated therefore lacks all three, and its
+/// history records this checksum, which the migrator refuses as a changed migration. Connecting failed with
+/// `VersionMismatch(1)` in either direction between the two releases, and dropping the schema to get past it threw
+/// away every job. [`repair_v0_1_schema`] brings such a database to what migration 1 creates today instead.
+const V0_1_MIGRATION_1_CHECKSUM: [u8; 48] = [
+    0xad, 0x4a, 0x08, 0x42, 0x5e, 0x3c, 0xf5, 0x80, 0x0f, 0xd2, 0xea, 0xf2, 0x52, 0x12, 0xf6, 0xc7, 0xd4, 0xaf, 0xae,
+    0x0b, 0x44, 0xfd, 0x33, 0x1c, 0x9a, 0x84, 0x83, 0x46, 0x74, 0x61, 0x79, 0xbf, 0x67, 0xfa, 0xcc, 0x06, 0x83, 0x73,
+    0xd1, 0x22, 0x32, 0x2f, 0x88, 0xbd, 0xf4, 0x1d, 0x72, 0x6b,
+];
+
+/// What 0.2.0's in-place edit added to migration 1, in the same definitions `0001_migration.sql` carries. A released
+/// migration can no longer change, which a test pins, so this copy cannot drift from it, and another test compares a
+/// repaired schema with a fresh one. Every statement is idempotent, and the column's constant default makes adding it
+/// a catalog change rather than a rewrite of the table.
+const V0_1_REPAIR_SQL: &str = r#"
+ALTER TABLE pgqueue.jobs ADD COLUMN IF NOT EXISTS refunds integer NOT NULL DEFAULT 0;
+ALTER TABLE pgqueue.jobs DROP CONSTRAINT IF EXISTS jobs_refunds_range_check;
+ALTER TABLE pgqueue.jobs ADD CONSTRAINT jobs_refunds_range_check CHECK (refunds BETWEEN 0 AND attempts);
+
+CREATE OR REPLACE FUNCTION pgqueue.job_page_keys(
+    p_queue     text,
+    p_kind      text,
+    p_statuses  text[],
+    p_cursor_at timestamptz,
+    p_cursor_id uuid,
+    p_limit     bigint
+)
+RETURNS TABLE (enqueued_at timestamptz, id uuid)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT candidate.enqueued_at, candidate.id
+    FROM unnest(p_statuses) AS requested(status)
+    CROSS JOIN LATERAL (
+        SELECT j.enqueued_at, j.id
+        FROM pgqueue.jobs j
+        WHERE j.queue = p_queue
+          AND j.kind = p_kind
+          AND j.status = requested.status
+          AND (j.enqueued_at, j.id) < (COALESCE(p_cursor_at, 'infinity'),
+                                       COALESCE(p_cursor_id, '00000000-0000-0000-0000-000000000000'))
+        ORDER BY j.enqueued_at DESC, j.id DESC
+        LIMIT p_limit
+    ) candidate
+$$;
+
+CREATE OR REPLACE FUNCTION pgqueue.job_page_keys_by_name(
+    p_queue     text,
+    p_kind      text,
+    p_statuses  text[],
+    p_name      text,
+    p_cursor_at timestamptz,
+    p_cursor_id uuid,
+    p_limit     bigint
+)
+RETURNS TABLE (enqueued_at timestamptz, id uuid)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT candidate.enqueued_at, candidate.id
+    FROM unnest(p_statuses) AS requested(status)
+    CROSS JOIN LATERAL (
+        SELECT j.enqueued_at, j.id
+        FROM pgqueue.jobs j
+        WHERE j.queue = p_queue
+          AND j.kind = p_kind
+          AND j.name = p_name
+          AND j.status = requested.status
+          AND (j.enqueued_at, j.id) < (COALESCE(p_cursor_at, 'infinity'),
+                                       COALESCE(p_cursor_id, '00000000-0000-0000-0000-000000000000'))
+        ORDER BY j.enqueued_at DESC, j.id DESC
+        LIMIT p_limit
+    ) candidate
+$$;
+"#;
+
+/// Repairs a database that pgqueue 0.1.0 migrated (see [`V0_1_MIGRATION_1_CHECKSUM`]): applies what 0.2.0 added to
+/// migration 1 and records migration 1's current checksum, in one transaction, so the database then reads as one the
+/// current release created. It repairs in place rather than through a new migration because it brings the database to
+/// what migration 1 itself already creates: a database that never ran 0.1.0 has nothing to repair, and its history is
+/// left exactly as it was.
+///
+/// The caller holds the migrator's advisory lock and bounds this connection's lock waits, as for any migration. The
+/// recorded checksum is read again under a row lock, so a repair that another process already committed, or a retry
+/// after a refused lock, changes nothing.
+async fn repair_v0_1_schema(connection: &mut PgConnection) -> Result<(), sqlx::migrate::MigrateError> {
+    let current = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 1 && !migration.migration_type.is_down_migration())
+        .map(|migration| migration.checksum.to_vec())
+        .ok_or(sqlx::migrate::MigrateError::VersionMissing(1))?;
+    let mut transaction = connection.begin().await?;
+    let recorded =
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT checksum FROM pgqueue.migrations WHERE version = 1 FOR UPDATE")
+            .fetch_optional(&mut *transaction)
+            .await?;
+    if recorded.as_deref() == Some(V0_1_MIGRATION_1_CHECKSUM.as_slice()) {
+        sqlx::raw_sql(V0_1_REPAIR_SQL).execute(&mut *transaction).await?;
+        sqlx::query("UPDATE pgqueue.migrations SET checksum = $1 WHERE version = 1")
+            .bind(current)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
 }
 
 async fn find_applied_migrations(connection: &mut PgConnection) -> Result<Vec<AppliedMigration>, sqlx::Error> {
@@ -96,7 +210,7 @@ async fn find_migration_status(connection: &mut PgConnection) -> Result<Migratio
     let applied = match find_applied_migrations(connection).await {
         Ok(applied) => applied,
         Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some(UNDEFINED_TABLE) => {
-            return Ok(MigrationStatus::Pending);
+            return Ok(MigrationStatus::Pending { repair_v0_1: false });
         }
         Err(error) => return Err(error.into()),
     };
@@ -109,6 +223,7 @@ async fn find_migration_status(connection: &mut PgConnection) -> Result<Migratio
 
     let expected =
         MIGRATOR.iter().filter(|migration| !migration.migration_type.is_down_migration()).collect::<Vec<_>>();
+    let mut repair_v0_1 = false;
     for (index, row) in applied.iter().enumerate() {
         let Some(migration) = expected.get(index) else {
             return Err(Error::Migration(sqlx::migrate::MigrateError::VersionMissing(row.version)));
@@ -123,10 +238,18 @@ async fn find_migration_status(connection: &mut PgConnection) -> Result<Migratio
             )));
         }
         if migration.checksum.as_ref() != row.checksum.as_slice() {
+            if row.version == 1 && row.checksum.as_slice() == V0_1_MIGRATION_1_CHECKSUM.as_slice() {
+                repair_v0_1 = true;
+                continue;
+            }
             return Err(Error::Migration(sqlx::migrate::MigrateError::VersionMismatch(row.version)));
         }
     }
-    if applied.len() == expected.len() { Ok(MigrationStatus::Current) } else { Ok(MigrationStatus::Pending) }
+    if applied.len() == expected.len() && !repair_v0_1 {
+        Ok(MigrationStatus::Current)
+    } else {
+        Ok(MigrationStatus::Pending { repair_v0_1 })
+    }
 }
 
 /// Begins every transaction the queue owns, and in the same round trip tells the server to end the session if the
@@ -436,11 +559,30 @@ fn is_lock_timeout(error: &sqlx::migrate::MigrateError) -> bool {
 /// caller holds the migrator's advisory lock across all of them, so a second
 /// replica waits on that lock rather than adding its own queued request for the
 /// table. Returns the last refusal once no attempt fits before `deadline`.
+///
+/// `repair_v0_1` runs [`repair_v0_1_schema`] at the start of each attempt, under the same bound, so its DDL waits no
+/// longer than a migration's would; it is idempotent, so an attempt refused after it committed repeats nothing.
 async fn run_migrations_until(
     connection: &mut PgConnection,
-    migrator: &sqlx::migrate::Migrator,
     deadline: tokio::time::Instant,
+    repair_v0_1: bool,
 ) -> Result<(), sqlx::migrate::MigrateError> {
+    // The status was rechecked while this connection held SQLx's migration
+    // lock, so the migrator must not acquire the same session lock again.
+    let mut migrator = sqlx::migrate!();
+    migrator.set_locking(false);
+    // Only the schemas that are missing. `CREATE SCHEMA IF NOT EXISTS` checks the role's CREATE privilege on the
+    // database before it checks whether the schema exists, so the migrator's own creation of a schema that is already
+    // there refused a role that owns it but may not create schemas: the least-privilege setup of a DBA who creates the
+    // schema in advance for the role that migrates it.
+    let wanted = migrator.create_schemas.iter().map(|schema| schema.to_string()).collect::<Vec<_>>();
+    let missing = sqlx::query_scalar::<_, String>(
+        "SELECT schema FROM unnest($1::text[]) AS wanted(schema) WHERE to_regnamespace(schema) IS NULL",
+    )
+    .bind(wanted)
+    .fetch_all(&mut *connection)
+    .await?;
+    migrator.create_schemas = missing.into_iter().map(std::borrow::Cow::Owned).collect();
     // Read once, on the connection whose waits it times: the check that cancels an autovacuum is this session's own.
     let deadlock_timeout = session_deadlock_timeout(connection).await?;
     let mut pause = MIGRATION_RETRY_INITIAL_PAUSE;
@@ -448,7 +590,12 @@ async fn run_migrations_until(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let attempt = migration_attempt_lock_timeout(remaining, deadlock_timeout);
         set_lock_timeout(connection, &format!("{}ms", attempt.as_millis())).await?;
-        let refused = match migrator.run_direct(None, &mut *connection, false).await {
+        let repaired = if repair_v0_1 { repair_v0_1_schema(connection).await } else { Ok(()) };
+        let result = match repaired {
+            Ok(()) => migrator.run_direct(None, &mut *connection, false).await,
+            Err(error) => Err(error),
+        };
+        let refused = match result {
             Err(error) if is_lock_timeout(&error) => error,
             result => return result,
         };
@@ -485,7 +632,7 @@ async fn ensure_migrations(pool: &PgPool, lock_timeout: Duration) -> Result<(), 
             connection.disarm();
             return Ok(());
         }
-        Ok(MigrationStatus::Pending) => {}
+        Ok(MigrationStatus::Pending { .. }) => {}
         Err(error) => {
             if set_lock_timeout(connection.connection(), &previous_lock_timeout).await.is_ok() {
                 connection.disarm();
@@ -501,14 +648,14 @@ async fn ensure_migrations(pool: &PgPool, lock_timeout: Duration) -> Result<(), 
         return Err(Error::Migration(error));
     }
 
-    match find_migration_status(connection.connection()).await {
+    let repair_v0_1 = match find_migration_status(connection.connection()).await {
         Ok(MigrationStatus::Current) => {
             connection.connection().unlock().await?;
             set_lock_timeout(connection.connection(), &previous_lock_timeout).await?;
             connection.disarm();
             return Ok(());
         }
-        Ok(MigrationStatus::Pending) => {}
+        Ok(MigrationStatus::Pending { repair_v0_1 }) => repair_v0_1,
         Err(error) => {
             let unlocked = connection.connection().unlock().await.is_ok();
             let restored = set_lock_timeout(connection.connection(), &previous_lock_timeout).await.is_ok();
@@ -517,13 +664,9 @@ async fn ensure_migrations(pool: &PgPool, lock_timeout: Duration) -> Result<(), 
             }
             return Err(error);
         }
-    }
+    };
 
-    // The status was rechecked while this connection held SQLx's migration
-    // lock, so the migrator must not acquire the same session lock again.
-    let mut migrator = sqlx::migrate!();
-    migrator.set_locking(false);
-    let result = run_migrations_until(connection.connection(), &migrator, deadline).await;
+    let result = run_migrations_until(connection.connection(), deadline, repair_v0_1).await;
     if let Err(error) = result {
         let unlocked = connection.connection().unlock().await.is_ok();
         let restored = set_lock_timeout(connection.connection(), &previous_lock_timeout).await.is_ok();
@@ -920,6 +1063,52 @@ impl From<&JobRow> for AttemptGuard {
     }
 }
 
+/// A row the claim took whose stored JSON this client cannot read, failed in the claim's own transaction (see
+/// [`decode_claimed_rows`]).
+struct UnreadableClaim {
+    id: Uuid,
+    attempts: i32,
+    reason: String,
+}
+
+/// The JSON columns a claim decodes. The schema checks keep every other column readable, but any valid `jsonb` fits
+/// these, and not every one decodes: nesting deeper than serde_json's recursion limit, or a number past `f64`'s range
+/// in a build without its `arbitrary_precision` feature.
+const CLAIMED_DOCUMENTS: [&str; 3] = ["payload", "result", "meta"];
+
+/// Decodes the rows a claim returned, setting aside the ones whose stored JSON cannot be read.
+///
+/// One such row used to fail the whole claim, and since it was rolled back and stayed first in line, every claim
+/// after it on its queue failed the same way until somebody found the row and deleted it: a stall any foreign SQL
+/// writer could cause with one `INSERT`. Such a row can never run, so the claim fails it instead (see
+/// [`Database::fail_unreadable_claims`]) and hands out the rest. Any other column that fails to decode still fails
+/// the claim, which rolls back as before.
+fn decode_claimed_rows(rows: &[sqlx::postgres::PgRow]) -> Result<(Vec<JobRow>, Vec<UnreadableClaim>), sqlx::Error> {
+    let mut jobs = Vec::with_capacity(rows.len());
+    let mut unreadable = Vec::new();
+    for row in rows {
+        match <JobRow as sqlx::FromRow<'_, sqlx::postgres::PgRow>>::from_row(row) {
+            Ok(job) => jobs.push(job),
+            // Only a document serde_json could not read is this row's alone. Any other failure on these columns — a
+            // type mismatch after the schema drifted, a `jsonb` format this sqlx does not speak — would fail every
+            // row the same way, and quarantining them all would fail a whole backlog instead of refusing the claim.
+            Err(sqlx::Error::ColumnDecode { index, source })
+                if CLAIMED_DOCUMENTS.iter().any(|column| index.trim_matches('"') == *column)
+                    && source.downcast_ref::<serde_json::Error>().is_some() =>
+            {
+                let reason = format!("pgqueue could not read this job's stored {}: {source}", index.trim_matches('"'));
+                unreadable.push(UnreadableClaim {
+                    id: sqlx::Row::try_get(row, "id")?,
+                    attempts: sqlx::Row::try_get(row, "attempts")?,
+                    reason: truncate_stored_error(&reason).into_owned(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((jobs, unreadable))
+}
+
 pub(crate) struct DatabaseDequeueBatch {
     pub(crate) jobs: Vec<JobRow>,
     pub(crate) intake_open: bool,
@@ -929,6 +1118,9 @@ pub(crate) struct DatabaseDequeueBatch {
     /// drained queue. Only an underfilled batch from the worker fetch loop is
     /// probed; every other batch reports `false` without checking.
     pub(crate) work_available: bool,
+    /// How many of the rows the claim took were unreadable and failed in its transaction instead of being returned
+    /// (see [`Database::fail_unreadable_claims`]). An empty batch with some is progress, not lock contention.
+    pub(crate) quarantined: usize,
 }
 
 #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
@@ -1162,16 +1354,16 @@ const UNHANDLED_REQUEUE_DELAY: Duration = Duration::from_secs(10);
 /// so some cycle lands on a worker that can run the job.
 const UNHANDLED_REQUEUE_JITTER: Duration = Duration::from_secs(5);
 
-/// The three statements that move an attempt to a terminal state, sharing the
-/// one rule they must never disagree about: a row whose retention deletes
+/// The statements that move an attempt to a terminal state, sharing the one
+/// rule they must never disagree about: a row whose retention deletes
 /// immediately is `DELETE`d rather than `UPDATE`d, and the completion
 /// notification fires for exactly the rows that finished, either way.
 ///
 /// Written once here rather than kept in sync by hand across
-/// [`Database::finish_with_guards`], [`Database::abort_stuck_abandoned_batch`]
-/// and [`abort_unsettled_claim`]: applying a change to that rule to two of the
-/// three leaves the third silently inconsistent. Each of the three has a
-/// direct test of the delete branch.
+/// [`Database::finish_with_guards`], [`Database::abort_stuck_abandoned_batch`],
+/// [`abort_unsettled_claim`] and [`Database::fail_unreadable_claims`]: applying
+/// a change to that rule to some of them leaves the rest silently inconsistent.
+/// Each has a direct test of the delete branch.
 ///
 /// `$candidates` is the CTE chain ending in a `candidate` that yields
 /// `(id, ttl_ms)` — already locked, since every caller reads the row it is
@@ -2709,8 +2901,8 @@ impl Database {
     ///
     /// Payloads and metadata travel as `text[]` and are cast to `jsonb` row by row. Bound as `jsonb[]`, each column was
     /// one array datum, which PostgreSQL caps at 1 GiB, and `jsonb` stores an array of small numbers in six times its
-    /// JSON text: a batch well inside [`crate::MAX_ENQUEUE_BATCH_BYTES`] failed with `54000` after the server parsed all
-    /// of it into memory at once.
+    /// JSON text: a batch well inside [`crate::MAX_ENQUEUE_BATCH_BYTES`] failed with `54000` after the server parsed
+    /// all of it into memory at once.
     async fn insert_jobs<'e>(
         &self,
         rows: &[(Uuid, &JobRequest, Option<Duration>)],
@@ -3595,6 +3787,35 @@ impl Database {
         self.dequeue_inner(limit, worker_id, true, true).await
     }
 
+    /// Fails the claimed rows [`decode_claimed_rows`] set aside, in the claim's transaction, so they leave the queue
+    /// together with the claim that took them. A row whose document cannot be read can never run, so it is failed
+    /// rather than retried, whatever attempts it has left, and its stored JSON is kept for an operator to inspect.
+    async fn fail_unreadable_claims(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        worker_id: Uuid,
+        unreadable: &[UnreadableClaim],
+    ) -> Result<(), sqlx::Error> {
+        for claim in unreadable {
+            tracing::warn!(
+                queue = %self.name,
+                job.id = %claim.id,
+                reason = %claim.reason,
+                "failed a claimed job whose stored JSON this client cannot read"
+            );
+        }
+        sqlx::query(FAIL_UNREADABLE_CLAIMS_SQL)
+            .bind(unreadable.iter().map(|claim| claim.id).collect::<Vec<_>>())
+            .bind(unreadable.iter().map(|claim| claim.attempts).collect::<Vec<_>>())
+            .bind(unreadable.iter().map(|claim| claim.reason.as_str()).collect::<Vec<_>>())
+            .bind(worker_id)
+            .bind(&self.name)
+            .bind(done_channel(&self.name))
+            .execute(&mut **transaction)
+            .await?;
+        Ok(())
+    }
+
     async fn dequeue_inner(
         &self,
         limit: i64,
@@ -3608,7 +3829,7 @@ impl Database {
 
         let mut connection = PoolConnectionGuard::new(self.pool.acquire().await?);
         let mut transaction = connection.begin_transaction().await?;
-        let claim = sqlx::query_as::<_, JobRow>(DEQUEUE_CLAIM_SQL)
+        let claim = sqlx::query(DEQUEUE_CLAIM_SQL)
             .bind(&self.name)
             .bind(self.priorities.0)
             .bind(self.priorities.1)
@@ -3618,8 +3839,19 @@ impl Database {
             .bind(self.claim_resolution_lock_key)
             .fetch_all(&mut *transaction)
             .await;
-        let mut jobs = match claim {
-            Ok(jobs) => jobs,
+        let claim = match claim {
+            Ok(rows) => decode_claimed_rows(&rows),
+            Err(error) => Err(error),
+        };
+        let claim = match claim {
+            Ok((jobs, unreadable)) if unreadable.is_empty() => Ok((jobs, unreadable)),
+            Ok((jobs, unreadable)) => {
+                self.fail_unreadable_claims(&mut transaction, worker_id, &unreadable).await.map(|()| (jobs, unreadable))
+            }
+            Err(error) => Err(error),
+        };
+        let (mut jobs, unreadable) = match claim {
+            Ok(claim) => claim,
             Err(error) => {
                 // Return the claim failure, not the rollback's. A claim that
                 // failed because the connection broke fails the rollback the
@@ -3660,6 +3892,9 @@ impl Database {
         };
         transaction.commit().await?;
         drop(connection);
+        for _ in &unreadable {
+            self.counters.record_failed();
+        }
 
         // The underfilled-batch probe is its own statement, run after the
         // decoded claim commits. It needs no consistency with the batch, and
@@ -3696,7 +3931,9 @@ impl Database {
             .bind(self.priorities.1)
             .fetch_one(&self.pool)
             .await;
-            resolve_post_commit_probe(&self.name, worker_id, jobs.len(), probe)?
+            // Quarantined rows count as claimed: their failure committed with the claim, so a probe that fails now
+            // must not turn that progress into an error, which would also leave them out of the worker's stats.
+            resolve_post_commit_probe(&self.name, worker_id, jobs.len() + unreadable.len(), probe)?
         } else {
             DatabaseDequeueProbe { intake_open: true, work_available: false }
         };
@@ -3705,7 +3942,12 @@ impl Database {
         // No await remains between here and the caller receiving the batch, so
         // the committed claim can no longer be lost to a dropped future.
         guard.disarm();
-        Ok(DatabaseDequeueBatch { jobs, intake_open: probe.intake_open, work_available: probe.work_available })
+        Ok(DatabaseDequeueBatch {
+            jobs,
+            intake_open: probe.intake_open,
+            work_available: probe.work_available,
+            quarantined: unreadable.len(),
+        })
     }
 
     /// Finishes the attempt `job` names, if it still owns its row.
@@ -4413,6 +4655,24 @@ pub(crate) const ABORT_UNSETTLED_CLAIM_SQL: &str = finish_rows_sql!(
     notify_each_finished_sql!("$8", "aborted")
 );
 
+/// The statement [`Database::fail_unreadable_claims`] binds: fails the rows `$1` at the attempts `$2` they were just
+/// claimed with, each with its reason in `$3`, provided worker `$4` of queue `$5` still holds them, and notifies the
+/// done channel `$6` for every one somebody is waiting on.
+pub(crate) const FAIL_UNREADABLE_CLAIMS_SQL: &str = finish_rows_sql!(
+    r#"requested AS (
+        SELECT * FROM unnest($1::uuid[], $2::integer[], $3::text[]) AS t(id, attempts, reason)
+    ),
+    candidate AS (
+        SELECT j.id, j.failed_ttl_ms AS ttl_ms, r.reason
+        FROM pgqueue.jobs j
+        JOIN requested r ON r.id = j.id
+        WHERE j.queue = $5 AND j.status = 'running' AND j.attempts = r.attempts AND j.worker_id = $4
+        FOR UPDATE OF j
+    )"#,
+    r#"status = 'failed', result = NULL, error = c.reason"#,
+    notify_each_finished_sql!("$6", "failed")
+);
+
 /// How long a resolver whose first try at its lock was refused waits for it
 /// before giving up the attempt. Claims commit in milliseconds, and once the
 /// resolver is queued no new one starts; behind a claim stuck idle in
@@ -4841,21 +5101,19 @@ fn spawn_dropped_attempt_resolver(
     runtime.spawn(async move {
         let mut delay = INITIAL_RETRY_DELAY;
         loop {
-            match resolve_dropped_attempt(
-                &context,
-                worker_id,
-                retry_delay_ms,
-                &claim,
-            )
-            .await
-            {
+            match resolve_dropped_attempt(&context, worker_id, retry_delay_ms, &claim).await {
                 Ok(resolution) => {
                     match resolution {
                         DroppedAttemptResolution::Requeued => context.counters.record_retry(),
                         DroppedAttemptResolution::Aborted => context.counters.record_abort(),
                         DroppedAttemptResolution::Unchanged => {}
                     }
-                    tracing::warn!(queue = %context.queue, job.id = %claim.id, ?resolution, "recovered a dropped attempt");
+                    tracing::warn!(
+                        queue = %context.queue,
+                        job.id = %claim.id,
+                        ?resolution,
+                        "recovered a dropped attempt"
+                    );
                     return;
                 }
                 Err(sqlx::Error::PoolClosed) => {
@@ -4867,7 +5125,12 @@ fn spawn_dropped_attempt_resolver(
                     return;
                 }
                 Err(error) => {
-                    tracing::warn!(queue = %context.queue, job.id = %claim.id, %error, "failed to recover a dropped attempt; retrying");
+                    tracing::warn!(
+                        queue = %context.queue,
+                        job.id = %claim.id,
+                        %error,
+                        "failed to recover a dropped attempt; retrying"
+                    );
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(MAX_RETRY_DELAY);
                 }

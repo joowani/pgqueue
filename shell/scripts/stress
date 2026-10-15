@@ -15,5 +15,6 @@ source "${BASH_SOURCE[0]%/*}/migrate"
 # The `#[ignore]`d tier: sustained-load tests that assert the library's invariants under real contention and run for
 # seconds to tens of seconds each. Every case creates its own concurrent workload; running cases in parallel only adds
 # machine-dependent contention between independent databases. Forward arguments so a run can be narrowed, as in
-# `CI=1 shell/scripts/stress dedupe`.
-cargo test --locked --workspace --all-features -- --ignored --test-threads=1 "$@"
+# `CI=1 shell/scripts/stress dedupe`. `--tests` leaves the doctests out: none is a stress test, so building them only
+# costs time, and under `--ignored` rustdoc would compile and run any `ignore` example.
+cargo test --locked --workspace --all-features --tests -- --ignored --test-threads=1 "$@"

@@ -1040,7 +1040,17 @@ impl std::fmt::Debug for JobContext {
 }
 
 /// Types that can be extracted from a [`JobContext`] — the trait behind every
-/// `#[pgqueue::job]` function parameter after the payload.
+/// parameter of a `#[pgqueue::cron]` function, and every `#[pgqueue::job]`
+/// function parameter after the payload.
+// A cron given a payload parameter fails this bound, and rustc's own wording, "`(): FromJobContext` is not
+// satisfied", did not say that crons take none.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a job context extractor",
+    label = "not an extractor",
+    note = "every parameter of a #[pgqueue::cron] function is an extractor, such as `JobContext` or `JobState<T>`: \
+            crons take no payload",
+    note = "every parameter of a #[pgqueue::job] function after the first, its payload, is an extractor"
+)]
 pub trait FromJobContext: Sized + Send {
     /// Extracts `Self`, or fails the attempt with a
     /// [`JobErrorKind::Extract`] error.
@@ -1627,6 +1637,35 @@ impl JobCronEntry {
         successor.min(occurrence.checked_add(grace).unwrap_or(successor))
     }
 
+    /// The shortest time any of this cron's occurrences stays publishable (see
+    /// [`JobCronEntry::publication_deadline`]): an explicit `Skip` grace at most, and otherwise sampled over at most
+    /// 64 occurrences in the year after the first one after `from`. `None` only for a cron without an explicit grace
+    /// whose first two occurrences are more than a year apart, which leaves it a grace of more than two months.
+    pub(crate) fn tightest_grace(&self, from: Timestamp) -> Option<Duration> {
+        let mut tightest = match self.options.misfire {
+            CronMisfirePolicy::Skip { grace: Some(grace) } => Some(SignedDuration::from_millis(duration_to_ms(grace))),
+            CronMisfirePolicy::Skip { grace: None } | CronMisfirePolicy::FireOnce => None,
+        };
+        let Ok(mut occurrence) = self.next_occurrence(from) else {
+            return tightest.and_then(|grace| Duration::try_from(grace).ok());
+        };
+        // From the first occurrence rather than from `from`, so a schedule that fires only on 29 February is sampled
+        // whenever the worker starts.
+        let Ok(horizon) = occurrence.checked_add(SignedDuration::from_hours(24 * 366)) else {
+            return tightest.and_then(|grace| Duration::try_from(grace).ok());
+        };
+        for _ in 0..64 {
+            let Ok(successor) = self.next_occurrence(occurrence) else { break };
+            if successor > horizon {
+                break;
+            }
+            let grace = self.publication_deadline(occurrence, successor).duration_since(occurrence);
+            tightest = Some(tightest.map_or(grace, |tightest| tightest.min(grace)));
+            occurrence = successor;
+        }
+        tightest.and_then(|grace| Duration::try_from(grace).ok())
+    }
+
     /// The job to enqueue for the occurrence at `at`.
     pub(crate) fn job_for(&self, at: Timestamp) -> JobRequest {
         let mut job = self.template.clone();
@@ -2143,7 +2182,7 @@ pub const MAX_ENQUEUE_BATCH_JOBS: usize = 1_000;
 /// [`MAX_ENQUEUE_BATCH_JOBS`] this keeps the batch's one statement well under
 /// the gigabyte PostgreSQL accepts in a single protocol message: every other
 /// parameter of that statement is small, and a batch of the largest documents
-/// [`JobRequest::validate`] admits would otherwise reach twice the limit.
+/// `JobRequest::validate` admits would otherwise reach twice the limit.
 pub const MAX_ENQUEUE_BATCH_BYTES: usize = 256 * 1_048_576;
 
 /// The serialized size of `value` in bytes, counted rather than allocated.
@@ -2232,22 +2271,14 @@ pub(crate) const MAX_JSON_DEPTH: usize = 127;
 
 /// Whether `value` nests containers more than `budget` levels deep.
 ///
-/// The damage from writing one is not confined to its own row: the dequeue
-/// decodes its batch inside the claiming transaction, so a single undecodable
-/// row fails the whole batch's decode, rolls the claim back — and is then
-/// re-selected by the next dequeue, which fails identically. One such row
-/// blocks every job queued behind it, claim after claim, until repaired by
-/// hand. `fetch_job` and `jobs_page` fail for the whole queue for as long as
-/// the row is retained. So it is refused here, before anything is written, the
-/// way `json_contains_nul` refuses a NUL.
+/// A job written with one could never run: the claim that first takes it cannot decode it, so it fails the row in its
+/// own transaction (see `Database::fail_unreadable_claims`), and `fetch_job` and `jobs_page` fail on any page that
+/// includes the row for as long as it is retained. So it is refused here, before anything is written, the way
+/// `json_contains_nul` refuses a NUL.
 ///
-/// A foreign SQL writer can still store one — `jsonb` has no cheap depth
-/// check, and taxing every legitimate enqueue with a recursive walk to refuse
-/// a hand-written row is the wrong trade — so the residual is deliberate, and
-/// bounded: the wedge is loud (`Dequeue` health carries the decode error), and
-/// the repair needs no SQL, because [`Queue::abort_job`](crate::Queue) and the
-/// dashboard's abort never decode the body — aborting the row moves it out of
-/// every claim.
+/// A foreign SQL writer can still store one — `jsonb` has no cheap depth check, and taxing every legitimate enqueue
+/// with a recursive walk to refuse a hand-written row is the wrong trade — so the residual is deliberate, and bounded:
+/// the claim fails such a row with a warning that names it, and hands out the rest of its batch.
 ///
 /// The walk is bounded by the same budget it is checking, so it cannot itself
 /// recurse past the limit it exists to enforce.
@@ -2280,11 +2311,10 @@ enum JsonNumberRefusal {
 /// A number PostgreSQL holds must also stay within `f64`'s range. The feature
 /// is per build, not per database: one process can enable it through any
 /// dependency while another sharing the queue does not, and serde_json without
-/// it refuses a number past `f64::MAX` outright. The dequeue claim decodes its
-/// rows before it commits, so a worker that could not read one rolled the
-/// claim back and selected the same row again on every attempt — nothing
-/// queued behind it ever ran. Tiny numbers are not refused: such a build reads
-/// them back as zero, which loses precision but stops nothing.
+/// it refuses a number past `f64::MAX` outright. A worker of such a build
+/// cannot read the job, so its claim fails it, however many attempts it has
+/// left. Tiny numbers are not refused: such a build reads them back as zero,
+/// which loses precision but stops nothing.
 ///
 /// A number in range can still grow: `jsonb` keeps it as `numeric` and prints
 /// it back as a full decimal expansion, so the eight bytes of `1e-16383` are
@@ -3092,11 +3122,12 @@ impl<J: JobType> JobHandle<J> {
         let mut poll_interval = INITIAL_POLL_INTERVAL;
         // When the poll that last saw this id claimed — `running`, or `aborting` on its way out of a run — was sent. A
         // poll that finds no row cannot tell a purged job from one that never existed, but a wait that watched the row
-        // run and *then* found it gone may have watched retention delete a finished job, which is `Error::ResultExpired`
-        // — what the push path reports through `resolve_deleted` for the same physical event. Without this, whether a
-        // caller learns "completed, result expired" or "no such job" depended on whether the completion notification
-        // happened to arrive, so a lagging channel — the normal state under many concurrent waiters — turned a finished
-        // job into a missing one. `vanished` decides from the time since whether retention can explain the deletion.
+        // run and *then* found it gone may have watched retention delete a finished job, which is
+        // `Error::ResultExpired` — what the push path reports through `resolve_deleted` for the same physical event.
+        // Without this, whether a caller learns "completed, result expired" or "no such job" depended on whether the
+        // completion notification happened to arrive, so a lagging channel — the normal state under many concurrent
+        // waiters — turned a finished job into a missing one. `vanished` decides from the time since whether retention
+        // can explain the deletion.
         //
         // A row last seen `queued` is the other case: retention deletes only finished rows, so what removes a queued
         // one is `Queue::purge_queued_jobs` or a foreign `DELETE`. A flag any live status set told the waiter on a job

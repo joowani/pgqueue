@@ -6,11 +6,13 @@
 /* app.css puts `font-size: 90%` on <html>, overriding Pico's own 100%-to-125% viewport scaling, so
    this page has to do the same or the two surfaces disagree on what a rem is: the sign-in card was
    rendering 39% larger than the change-password dialog it sits next to in the product. With one
-   scale shared, the sizes below can be the same numbers `.account-dialog` uses in app.css. */
+   scale shared, the sizes below can be the same numbers `.app-dialog` uses in app.css. */
 html { height: 100%; font-size: 90%; letter-spacing: 0; }
 body { min-height: 100%; letter-spacing: 0; }
 body { display: grid; margin: 0; place-items: center; background: var(--pico-background-color); }
-main { width: min(28rem, calc(100% - 2rem)); padding: 2rem 0; } /* 28rem: `.account-dialog article` */
+/* `body > main`, not `main`: Pico pads `body>main`, which outranks a bare `main`, so this padding never applied and
+   the card had 1rem above and below it instead of 2rem. 28rem: `.app-dialog article`. */
+body > main { width: min(28rem, calc(100% - 2rem)); padding: 2rem 0; }
 article {
   margin: 0;
   padding: 1.5rem;
@@ -34,12 +36,12 @@ h1 {
   letter-spacing: 0;
 }
 .login-logo { flex: 0 0 auto; width: 1.5rem; height: 1.5rem; vertical-align: middle; }
-label { font-size: 0.8rem; }        /* `.account-dialog label` */
-/* `.account-dialog input`. The `[type]` is load-bearing, not decoration: Pico spaces fields with
+label { font-size: 0.8rem; }        /* `.app-dialog label` */
+/* `.app-dialog input`. The `[type]` is load-bearing, not decoration: Pico spaces fields with
    `input:not([type=checkbox],[type=radio])`, whose `:not()` argument lifts it to the same
    specificity as an attribute selector, so a bare `input` here would lose. */
 input[type] { margin-bottom: 0.8rem; }
-/* `.account-dialog footer button` in app.css, but full width, since this is the page's one primary
+/* `.app-dialog footer button` in app.css, but full width, since this is the page's one primary
    action. The selector has to carry `[type="submit"]`: Pico sizes buttons through a selector list
    that includes `[type=submit]`, which outranks a bare `button` and would silently win. app.css
    dodges the same collision by scoping its copy with a class. */

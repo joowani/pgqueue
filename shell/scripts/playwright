@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#
+# Drives the dashboard in the installed Google Chrome with Playwright, such as to take screenshots of a UI change.
+#
+# Usage: shell/scripts/playwright <script.mjs> [arguments]
+#
+# The script's default export receives { page, context, browser, origin, args } and runs with the page at the
+# dashboard's origin: http://localhost:8080, where the dashboard example serves, unless PLAYWRIGHT_ORIGIN names another.
+# Paths in the script resolve from the repository root. Chrome runs headed, but in the background: on macOS, the app
+# that was in front gets the focus back once Chrome opens. Set PLAYWRIGHT_SIZE=WIDTHxHEIGHT to change the viewport,
+# 1440x900 by default, and PLAYWRIGHT_ARGS to pass Chrome more flags, separated by spaces. The Playwright version
+# shell/playwright/package.json pins is installed on first use and whenever its lockfile changes; it drives the
+# installed Chrome, so no browser is downloaded.
+#
+# With no arguments, show this help. Use --help, -h, or help to show it explicitly.
+
+set -euo pipefail
+
+case "${1:-}" in
+    '' | -h | --help | help)
+        awk 'NR < 3 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"
+        exit 0
+        ;;
+esac
+
+script="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+shift
+
+cd "${BASH_SOURCE[0]%/*}/../.."
+
+[[ -d "/Applications/Google Chrome.app" || $(uname) != Darwin ]] ||
+    { echo "Google Chrome is required; install it from https://www.google.com/chrome/" >&2; exit 1; }
+
+stamp="shell/playwright/node_modules/.pgqueue-installed"
+if [[ ! -f $stamp || shell/playwright/pnpm-lock.yaml -nt $stamp ]]; then
+    pnpm --dir shell/playwright install --frozen-lockfile >&2
+    touch "$stamp"
+fi
+
+front_app=''
+if [[ $(uname) == Darwin ]]; then
+    front_app="$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' \
+        2> /dev/null || true)"
+fi
+
+# Node resolves `playwright` from shell/playwright, where it is the one dependency.
+cd shell/playwright
+SCRIPT="$script" FRONT_APP="$front_app" REPO_ROOT="${PWD%/shell/playwright}" exec node --input-type=module - "$@" <<'JS'
+import { execFile } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+import { chromium } from 'playwright';
+
+const [width, height] = (process.env.PLAYWRIGHT_SIZE ?? '1440x900').split('x').map(Number);
+const origin = process.env.PLAYWRIGHT_ORIGIN ?? 'http://localhost:8080';
+process.chdir(process.env.REPO_ROOT);
+
+const extra = (process.env.PLAYWRIGHT_ARGS ?? '').split(' ').filter((arg) => arg !== '');
+const args = [`--window-size=${width},${height}`, ...extra];
+const browser = await chromium.launch({ channel: 'chrome', headless: false, args });
+if (process.env.FRONT_APP) {
+  const app = process.env.FRONT_APP.replaceAll('"', '\\"');
+  execFile('osascript', ['-e', `tell application "${app}" to activate`], () => {});
+}
+try {
+  const context = await browser.newContext({ viewport: { width, height } });
+  const page = await context.newPage();
+  page.on('pageerror', (error) => console.error(`page error: ${error.message}`));
+  await page.goto(origin);
+  const { default: run } = await import(pathToFileURL(process.env.SCRIPT).href);
+  await run({ page, context, browser, origin, args: process.argv.slice(2) });
+} finally {
+  await browser.close();
+}
+JS

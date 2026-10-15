@@ -55,9 +55,10 @@ impl Ledger {
 /// The pool ceiling is a budget, not a throughput need: a process peaks at
 /// `max + 2` server connections plus one per worker (pool plus the dedicated
 /// listener and sweep leadership connections, and each worker's lease
-/// connection), these tests run at cargo's full parallelism, and Docker Compose
-/// configures `max_connections = 300`. At 12 per pool, every test running at
-/// once on a 16-17-core host stays under that;
+/// connection), and Docker Compose configures `max_connections = 300`.
+/// `shell/scripts/stress` runs these tests one at a time, but a direct `cargo
+/// test -- --ignored` runs them at cargo's full parallelism, and at 12 per pool
+/// every test running at once on a 16-17-core host stays under that;
 /// nothing here holds a connection across a handler, so a smaller pool only
 /// queues acquires rather than deadlocking.
 async fn stress_queue(tag: &str, customize: impl FnOnce(QueueBuilder) -> QueueBuilder) -> (Queue, String) {
@@ -947,10 +948,15 @@ async fn test_stress_abort_and_retry_settle_every_row() {
 
 /// The dashboard reads the same pool the worker runs on, and its data routes
 /// are polled continuously by every open tab. Under a request flood beside a
-/// busy worker, no data route may fail and the worker must still drain the
-/// queue. `/health` has a deliberate two-second availability bound, so probe it
-/// outside the synthetic flood rather than treating its documented overload
-/// response as an internal failure.
+/// busy worker, every data route must keep answering successfully and the
+/// worker must still drain the queue. `/health` has a deliberate two-second
+/// availability bound, so probe it outside the synthetic flood rather than
+/// treating its documented overload response as an internal failure.
+///
+/// Any answer but a success counts as a failure, not only a 5xx, and every
+/// route must have answered successfully at least once: the routes refuse
+/// unknown query parameters, so a renamed one turned every request here into a
+/// 400, and a flood of those measured nothing while the test still passed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "stress test"]
 async fn test_stress_dashboard_serves_under_load_beside_a_worker() {
@@ -984,18 +990,22 @@ async fn test_stress_dashboard_serves_under_load_beside_a_worker() {
     ];
 
     let failures = Arc::new(AtomicU32::new(0));
+    let successes = paths.iter().map(|_| Arc::new(AtomicU32::new(0))).collect::<Vec<_>>();
     let stop = CancellationToken::new();
     let mut hammers = Vec::new();
-    for path in paths {
+    for (path, succeeded) in paths.iter().zip(&successes) {
         for _ in 0..4 {
             let router = router.clone();
             let path = path.clone();
             let failures = failures.clone();
+            let succeeded = succeeded.clone();
             let stop = stop.clone();
             hammers.push(tokio::spawn(async move {
                 while !stop.is_cancelled() {
                     let (status, body) = crate::dashboard_test::request(&router, "GET", &path, None).await;
-                    if status.is_server_error() {
+                    if status.is_success() {
+                        succeeded.fetch_add(1, Ordering::SeqCst);
+                    } else {
                         failures.fetch_add(1, Ordering::SeqCst);
                         eprintln!("dashboard data route {path} answered {status}: {body:?}");
                     }
@@ -1023,7 +1033,10 @@ async fn test_stress_dashboard_serves_under_load_beside_a_worker() {
     shutdown.cancel();
     running.await.expect("worker join").expect("worker run");
 
-    assert_eq!(failures.load(Ordering::SeqCst), 0, "dashboard data route answered 5xx under load");
+    assert_eq!(failures.load(Ordering::SeqCst), 0, "a dashboard data route failed under load");
+    for (path, succeeded) in paths.iter().zip(&successes) {
+        assert!(succeeded.load(Ordering::SeqCst) > 0, "dashboard data route {path} never answered successfully");
+    }
     assert_fully_drained(&queue, JOBS as i64, "dashboard").await;
 }
 
@@ -1348,8 +1361,8 @@ async fn test_stress_runtime_cron_is_cluster_safe() {
 // ---------------------------------------------------------------------------
 
 /// The dashboard's retry and abort buttons are `POST` routes onto the same
-/// operator controls. Driven concurrently against a working queue they must
-/// answer without a 5xx and leave every row terminal.
+/// operator controls. Driven concurrently against a working queue, every abort
+/// and every retry must succeed and take effect, and every row must end terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "stress test"]
 async fn test_stress_dashboard_mutations_stay_consistent() {
@@ -1372,9 +1385,12 @@ async fn test_stress_dashboard_mutations_stay_consistent() {
         let path = format!("/api/queues/{name}/jobs/{id}/abort");
         posts.push(tokio::spawn(async move { crate::dashboard_test::request(&router, "POST", &path, None).await }));
     }
+    // Every job is still live when its abort lands, so each must be applied, not merely answered: a declined abort, or
+    // a 4xx after a renamed route or header, would otherwise pass as long as one job settled.
     for post in posts {
         let (status, body) = post.await.expect("abort post");
-        assert!(!status.is_server_error(), "dashboard abort answered {status}: {body:?}");
+        assert!(status.is_success(), "dashboard abort answered {status}: {body:?}");
+        assert_eq!(body["aborted"], true, "dashboard abort declined: {body:?}");
     }
 
     wait_until(
@@ -1396,9 +1412,11 @@ async fn test_stress_dashboard_mutations_stay_consistent() {
         let path = format!("/api/queues/{name}/jobs/{id}/retry");
         retries.push(tokio::spawn(async move { crate::dashboard_test::request(&router, "POST", &path, None).await }));
     }
+    // Every one is terminal and not yet retried, so each retry must be applied too.
     for retry in retries {
         let (status, body) = retry.await.expect("retry post");
-        assert!(!status.is_server_error(), "dashboard retry answered {status}: {body:?}");
+        assert!(status.is_success(), "dashboard retry answered {status}: {body:?}");
+        assert_eq!(body["retried"], true, "dashboard retry declined: {body:?}");
     }
 
     wait_until(

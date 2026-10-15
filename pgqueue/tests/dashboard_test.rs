@@ -680,14 +680,19 @@ async fn test_job_detail_retry_and_abort_actions(pool: PgPool) {
     let (_, body) = get_json(&router, &format!("/api/queues/default/jobs/{retry_id}")).await;
     assert_eq!(body["job"]["retried_at"], Value::Null, "{body}");
 
-    // Retrying a queued job is a no-op.
-    let (_, body) = post_json(&router, &format!("/api/queues/default/jobs/{retry_id}/retry")).await;
+    // Retrying a queued job is a no-op, answered as a refusal rather than as a missing job.
+    let (status, body) = post_json(&router, &format!("/api/queues/default/jobs/{retry_id}/retry")).await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(body["retried"], false);
 
-    // Missing job.
+    // Missing job: an action on one is answered like a read of it, not as a refusal on account of its state.
     let missing = Uuid::now_v7();
     let (status, _) = get_json(&router, &format!("/api/queues/default/jobs/{missing}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    for action in ["retry", "abort"] {
+        let (status, body) = post_json(&router, &format!("/api/queues/default/jobs/{missing}/{action}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{action}: {body}");
+    }
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -697,16 +702,15 @@ async fn test_dashboard_mutations_are_scoped_to_the_route_queue(pool: PgPool) {
     let id = db.queue.enqueue_raw(new_job("owned", |_| {})).await.unwrap().unwrap();
     let router = dashboard([db.queue.clone(), other]).router().unwrap();
 
-    let (status, body) = post_json(&router, &format!("/api/queues/other/jobs/{id}/abort")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["aborted"], false);
+    // Through another queue's route the job does not exist, as a read through it already said.
+    let (status, _) = post_json(&router, &format!("/api/queues/other/jobs/{id}/abort")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(db.queue.fetch_job(id).await.unwrap().unwrap().status, JobStatus::Queued);
 
     let (_, body) = post_json(&router, &format!("/api/queues/default/jobs/{id}/abort")).await;
     assert_eq!(body["aborted"], true);
-    let (status, body) = post_json(&router, &format!("/api/queues/other/jobs/{id}/retry")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["retried"], false);
+    let (status, _) = post_json(&router, &format!("/api/queues/other/jobs/{id}/retry")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(db.queue.fetch_job(id).await.unwrap().unwrap().status, JobStatus::Aborted);
 }
 
@@ -1245,11 +1249,10 @@ async fn test_browser_auth_can_opt_out_of_secure_cookies_for_direct_http(pool: P
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_authentication_failure_waits_before_rejecting_supplied_credentials(pool: PgPool) {
+async fn test_authentication_failure_rejects_supplied_credentials_on_both_channels(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
     let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
-    let started = tokio::time::Instant::now();
     let response = router
         .clone()
         .oneshot(
@@ -1263,16 +1266,13 @@ async fn test_authentication_failure_waits_before_rejecting_supplied_credentials
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert!(started.elapsed() >= Duration::from_millis(90));
 
-    let started = tokio::time::Instant::now();
     let (status, _) = request(&router, "GET", "/api/queues", Some("Basic d3Jvbmc6Y3JlZHM=")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(started.elapsed() >= Duration::from_millis(90));
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_valid_basic_credentials_are_accepted_when_failed_comparison_is_in_flight(pool: PgPool) {
+async fn test_valid_basic_credentials_are_accepted_right_after_a_failed_one(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
     let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
 
@@ -1326,8 +1326,8 @@ async fn test_authentication_attempts_are_refused_when_the_attempt_budget_is_spe
     };
 
     // Enough guesses at once to outrun the budget however large the burst is:
-    // each spends its attempt before it waits, so the ones past the burst find
-    // nothing left to spend and are refused without being compared at all.
+    // each spends its attempt before anything is compared, so the ones past the
+    // burst find nothing left to spend and are refused without being compared.
     let mut guesses = tokio::task::JoinSet::new();
     for _ in 0..64 {
         guesses.spawn(invalid_request());
@@ -1359,13 +1359,36 @@ async fn test_authentication_attempts_are_refused_when_the_attempt_budget_is_spe
     );
 }
 
+/// The current password is a credential like the sign-in's, and a stolen session cookie must not make it guessable
+/// at request rate: guessing it would let an attacker rotate the password, signing the operator out for good. Each
+/// wrong guess spends the sign-in budget, so a burst of them is refused past it, with a `Retry-After`.
 #[sqlx::test(migrations = "./migrations")]
-async fn test_password_change_throttles_wrong_current_password_and_accepts_correct(pool: PgPool) {
+async fn test_password_change_throttles_guessing_the_current_password(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
     let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
     let cookie = login_cookie(&router).await;
 
-    let started = tokio::time::Instant::now();
+    let mut refused = 0;
+    for attempt in 0..40 {
+        let response = dashboard_change_password(&router, &cookie, &format!("wrong-{attempt}"), "newsecret").await;
+        match response.status() {
+            StatusCode::FORBIDDEN => {}
+            StatusCode::TOO_MANY_REQUESTS => {
+                assert!(response.headers().contains_key(header::RETRY_AFTER), "a refusal says when to come back");
+                refused += 1;
+            }
+            status => panic!("unexpected {status}"),
+        }
+    }
+    assert!(refused > 0, "guessing the current password was never throttled");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_password_change_refuses_a_wrong_current_password_and_accepts_the_correct_one(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let router = dashboard([db.queue.clone()]).basic_auth("admin", "s3cretpw").router().unwrap();
+    let cookie = login_cookie(&router).await;
+
     let response = router
         .clone()
         .oneshot(
@@ -1381,7 +1404,6 @@ async fn test_password_change_throttles_wrong_current_password_and_accepts_corre
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert!(started.elapsed() >= Duration::from_millis(90));
 
     let response = router
         .oneshot(
@@ -3568,8 +3590,8 @@ async fn test_a_body_of_exactly_the_cap_comes_back_parsed(pool: PgPool) {
     assert_eq!(body["job"]["payload"].as_str().map(|body| body.chars().count()), Some(64 * 1024));
 }
 
-/// PostgreSQL can store JSON nested deeper than serde_json's recursion limit. Show an unreadable body as text so
-/// an operator can inspect it, regardless of whether dependency feature unification enables arbitrary-precision numbers.
+/// PostgreSQL can store JSON nested deeper than serde_json's recursion limit. Show an unreadable body as text so an
+/// operator can inspect it, regardless of whether dependency feature unification enables arbitrary-precision numbers.
 #[sqlx::test(migrations = "./migrations")]
 async fn test_a_body_this_client_cannot_parse_is_shown_rather_than_dropped(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
@@ -3863,8 +3885,7 @@ async fn dashboard_login_from_site(
 /// preflight. Each post spent a comparison from the *victim's* interactive
 /// budget, keyed to the victim's own address, before anything was compared: a
 /// page they merely visited locked them out of their own dashboard, however
-/// privately it is bound. Sequential posts do not do it — the failure delay
-/// matches the refill rate — so the flood below is concurrent, which is what an
+/// privately it is bound. The flood below is concurrent, which is what an
 /// attacking page actually does.
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dashboard_login_refuses_a_cross_site_post_before_spending_the_budget(pool: PgPool) {
@@ -3885,8 +3906,8 @@ async fn test_dashboard_login_refuses_a_cross_site_post_before_spending_the_budg
     }
 
     // The operator's own address — the one the flood is charged to, if it is
-    // charged to anything — while the flood is still in flight, because a
-    // budget spent and refilled by the time they arrive is no lockout.
+    // charged to anything — right after the flood, because a budget spent and
+    // refilled by the time they arrive is no lockout.
     let login = dashboard_login_from(&router, Some(dashboard_peer(1)), "s3cretpw").await;
     assert_eq!(
         login.status(),
@@ -4010,8 +4031,8 @@ async fn test_dashboard_login_refuses_a_mismatched_origin_without_fetch_metadata
 /// Browsers attach Fetch Metadata only to potentially trustworthy URLs, so over plain HTTP to anything but loopback —
 /// the `secure_cookies(false)` deployment — the `Origin` fallback above is the whole guard. And the `Origin` the login
 /// form posts with follows the login page's own `Referrer-Policy`: under `no-referrer` the Fetch standard serializes it
-/// as `null` even for a same-origin post, which the fallback refuses as opaque. Chrome and Firefox both do exactly that,
-/// so a dashboard sending `no-referrer` answered its operator's correct password with "Cross-site login posts are
+/// as `null` even for a same-origin post, which the fallback refuses as opaque. Chrome and Firefox both do exactly
+/// that, so a dashboard sending `no-referrer` answered its operator's correct password with "Cross-site login posts are
 /// refused." at every LAN address. `same-origin` keeps the post's real origin and still withholds every referrer from
 /// other origins.
 #[sqlx::test(migrations = "./migrations")]
@@ -4319,13 +4340,11 @@ async fn test_dashboard_password_minimum_counts_characters_not_bytes(pool: PgPoo
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-/// The delay a rejection carries bounds the latency of one guess, never the
-/// rate of guesses: every concurrent failure past the single in-flight permit
-/// was refused instantly, and a *correct* password skipped the gate entirely.
-/// 303-versus-429 was therefore an unthrottled oracle — measured at ~4,800
-/// guesses a second. The budget is now spent before anything is compared, so a
-/// saturated account answers a correct password exactly as it answers a wrong
-/// one.
+/// Concurrent guesses were once compared as fast as the network delivered them,
+/// and a *correct* password skipped the gate entirely, so 303-versus-429 was an
+/// unthrottled oracle — measured at ~4,800 guesses a second. The budget is now
+/// spent before anything is compared, so a saturated account answers a correct
+/// password exactly as it answers a wrong one.
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dashboard_refuses_a_correct_password_while_guesses_have_the_budget_spent(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
@@ -4336,10 +4355,10 @@ async fn test_dashboard_refuses_a_correct_password_while_guesses_have_the_budget
         let router = router.clone();
         guesses.spawn(async move { dashboard_login(&router, &format!("wrong-{attempt}")).await.status() });
     }
-    // Every guess spends its attempt before its first await, so a handful of
-    // scheduler turns — microseconds, far short of a refill — leaves the state
-    // a burst of concurrent guesses leaves behind. No database work happens on
-    // either path, so nothing here waits on the pool.
+    // Every guess is decided within its first poll, so a handful of scheduler
+    // turns — microseconds, far short of a refill — leaves the state a burst of
+    // concurrent guesses leaves behind. No database work happens on either
+    // path, so nothing here waits on the pool.
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
@@ -4624,9 +4643,9 @@ async fn dashboard_login_forwarded_to(
 /// Starts a burst of wrong logins that all arrive through `peer`, each carrying
 /// the chain `chain(attempt)`, and returns once they have spent what they can.
 ///
-/// The guesses are still in flight: a budget refills a token every
-/// `AUTH_ATTEMPT_REFILL`, and joining them would wait out the rejection delay
-/// they each sleep — so what the caller is measuring has to be measured now.
+/// The guesses may still be in flight when it returns: a budget refills a
+/// token every `AUTH_ATTEMPT_REFILL`, so what the caller is measuring has to
+/// be measured now, before time hands any back.
 async fn dashboard_forwarded_flood(
     router: &Router,
     peer: ConnectInfo<SocketAddr>,
@@ -4640,8 +4659,8 @@ async fn dashboard_forwarded_flood(
             dashboard_login_forwarded(&router, peer, &forwarded, &format!("wrong-{attempt}")).await.status()
         });
     }
-    // Every guess spends its attempt before its first await, so a few scheduler
-    // turns leave the state a concurrent burst leaves behind.
+    // Every guess is decided within its first poll, so a few scheduler turns
+    // leave the state a concurrent burst leaves behind.
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }

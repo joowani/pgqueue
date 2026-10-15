@@ -1,11 +1,15 @@
 # Configuration for `prek` (https://prek.j178.dev), run before every commit and in CI.
 # Schema: https://www.schemastore.org/prek.json
-minimum_prek_version = "0.4.0"
+# 0.5.4 is the first release that reads `hide_status` and `include_deleted` from this file.
+minimum_prek_version = "0.5.4"
 default_install_hook_types = ["pre-commit"]
 
 # Hooks run cheapest first and the run stops at the first failure, so a commit that is already going to be rejected
 # never pays for a full test run.
 fail_fast = true
+
+# Report only failing hooks, with their full output, so a clean run prints nothing.
+hide_status = ["passed", "skipped"]
 
 # Vendored, minified files are not ours to reformat.
 exclude = '\.min\.(css|js)$'
@@ -16,8 +20,11 @@ hooks = [
     { id = "trailing-whitespace" },
     { id = "end-of-file-fixer" },
     { id = "mixed-line-ending", args = ["--fix=lf"] },
-    { id = "check-merge-conflict" },
-    { id = "check-added-large-files", args = ["--maxkb=1024"] },
+    # Both flags make the hooks check every file they are given. Without them, CI's clean checkout checked nothing: the
+    # first hook looks only at files staged for addition, and the second only during a merge or rebase, which misses
+    # conflict markers left by a cherry-pick or a `git stash pop`.
+    { id = "check-merge-conflict", args = ["--assume-in-merge"] },
+    { id = "check-added-large-files", args = ["--maxkb=1024", "--enforce-all"] },
     { id = "detect-private-key" },
     { id = "check-json" },
     { id = "check-toml" },
@@ -27,24 +34,109 @@ hooks = [
     { id = "destroyed-symlinks" },
 ]
 
+# Each local hook runs only when a file it reads changes, or the script that defines it. Deleting a file counts as a
+# change wherever the deletion alone can break the hook. CI passes `--all-files`, so every hook runs there.
 [[repos]]
 repo = "local"
 
 [[repos.hooks]]
-id = "check"
-name = "run checks"
-entry = "shell/scripts/check"
+id = "migrations"
+name = "check migration names"
+entry = "shell/scripts/check migrations"
 language = "system"
-always_run = true
+files = { glob = ["pgqueue/migrations/**", "shell/scripts/check"] }
+include_deleted = true
 pass_filenames = false
 
-# The test and stress hooks skip themselves unless `CI` is set, to keep commits under 30 seconds.
+[[repos.hooks]]
+id = "width"
+name = "check line width"
+entry = "shell/scripts/check width"
+language = "system"
+files = { glob = [
+    "**/*.md",
+    "**/*.rs",
+    "**/*.mjs",
+    "**/*.css",
+    "**/*.toml",
+    "**/*.yml",
+    "**/*.yaml",
+    "**/*.sql",
+    "shell/scripts/*",
+] }
+pass_filenames = false
+
+[[repos.hooks]]
+id = "dashboard-test"
+name = "run dashboard tests"
+entry = "node --test pgqueue/tests/dashboard/app.test.mjs"
+language = "system"
+files = { glob = ["pgqueue/dashboard/**", "pgqueue/tests/dashboard/**"] }
+include_deleted = true
+pass_filenames = false
+
+[[repos.hooks]]
+id = "fmt"
+name = "check formatting"
+entry = "shell/scripts/check fmt"
+language = "system"
+files = { glob = ["**/*.rs", "**/Cargo.toml", "rustfmt.toml", "rust-toolchain.toml", "shell/scripts/check"] }
+include_deleted = true
+pass_filenames = false
+
+# A new advisory can flag an unchanged lockfile. CI audits on every run, so it still catches those.
+[[repos.hooks]]
+id = "audit"
+name = "audit dependencies"
+entry = "shell/scripts/check audit"
+language = "system"
+files = { glob = ["Cargo.lock", "shell/scripts/check"] }
+include_deleted = true
+pass_filenames = false
+
+# `sqlx::migrate!()` reads the migrations and `sqlx.toml` at compile time, and a test embeds the README.
+[[repos.hooks]]
+id = "clippy"
+name = "run clippy"
+entry = "shell/scripts/check clippy"
+language = "system"
+files = { glob = [
+    "**/*.rs",
+    "**/Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "clippy.toml",
+    "rust-toolchain.toml",
+    "pgqueue/sqlx.toml",
+    "pgqueue/migrations/**",
+    "shell/scripts/check",
+] }
+include_deleted = true
+pass_filenames = false
+
+# The test and stress hooks skip themselves unless `CI` is set, to keep commits under 30 seconds. Besides what clippy
+# reads, the Rust suite reads the database settings, the embedded dashboard, and its own fixtures.
 [[repos.hooks]]
 id = "test"
 name = "run tests"
 entry = "shell/scripts/test"
 language = "system"
-always_run = true
+files = { glob = [
+    "**/*.rs",
+    "**/Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "README.md",
+    "compose.yaml",
+    "pgqueue/sqlx.toml",
+    "pgqueue/migrations/**",
+    "pgqueue/dashboard/**",
+    "pgqueue/tests/fixtures/**",
+    "pgqueue/tests/macros/**",
+    "shell/scripts/migrate",
+    "shell/scripts/test",
+] }
+include_deleted = true
 pass_filenames = false
 
 [[repos.hooks]]
@@ -52,5 +144,20 @@ id = "stress"
 name = "run stress tests"
 entry = "shell/scripts/stress"
 language = "system"
-always_run = true
+files = { glob = [
+    "**/*.rs",
+    "**/Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "README.md",
+    "compose.yaml",
+    "pgqueue/sqlx.toml",
+    "pgqueue/migrations/**",
+    "pgqueue/dashboard/**",
+    "pgqueue/tests/fixtures/**",
+    "pgqueue/tests/macros/**",
+    "shell/scripts/migrate",
+    "shell/scripts/stress",
+] }
+include_deleted = true
 pass_filenames = false

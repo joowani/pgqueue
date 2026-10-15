@@ -3,18 +3,28 @@
 //!
 //! Run it as a standalone server:
 //!
-//! ```ignore
+//! ```no_run
+//! # use pgqueue::Dashboard;
+//! # async fn run(queue: pgqueue::Queue) -> anyhow::Result<()> {
 //! Dashboard::new([queue])
 //!     .basic_auth("admin", "password")
 //!     .secure_cookies(false) // only for direct HTTP on a trusted network
 //!     .serve_on("0.0.0.0", 8080)
 //!     .run()
 //!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Or host it inside a worker process:
 //!
-//! ```ignore
+//! ```no_run
+//! # use pgqueue::{Dashboard, Worker};
+//! # #[pgqueue::job]
+//! # async fn job(_: ()) -> anyhow::Result<()> {
+//! #     Ok(())
+//! # }
+//! # async fn run(queue: pgqueue::Queue) -> anyhow::Result<()> {
 //! let dashboard = Dashboard::new([queue.clone()])
 //!     .basic_auth("admin", "password")
 //!     .secure_cookies(false) // only for direct HTTP on a trusted network
@@ -24,6 +34,8 @@
 //!     .dashboard(dashboard)
 //!     .run()
 //!     .await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Or mount its router in an existing axum application. Serve that application
@@ -34,8 +46,11 @@
 //! from anywhere answers the operator's correct login `429` for as long as it
 //! runs:
 //!
-//! ```ignore
-//! app.nest(
+//! ```no_run
+//! # use std::net::SocketAddr;
+//! # use pgqueue::Dashboard;
+//! # async fn run(queue: pgqueue::Queue, app: axum::Router, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+//! let app = app.nest(
 //!     "/admin",
 //!     Dashboard::new([queue])
 //!         .allow_unauthenticated() // application middleware protects this router
@@ -43,7 +58,9 @@
 //!         .mount_path("/admin")
 //!         .router()?,
 //! );
-//! axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>());
+//! axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Building requires an explicit choice: use [`Dashboard::basic_auth`], or call
@@ -71,7 +88,7 @@
 //! IP addresses, `localhost`, the host given to [`Dashboard::serve_on`], and the names listed with
 //! [`Dashboard::allowed_hosts`]. `/health` answers under any name.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -632,6 +649,17 @@ impl Dashboard {
     /// Controls the `Secure` attribute on browser session cookies. Defaults
     /// to `true`; disable it only for direct plain-HTTP access on a trusted
     /// network. TLS-terminated deployments should keep the secure default.
+    ///
+    /// The same flag states that the dashboard is reached over HTTPS, so while
+    /// it is `true` every response also carries
+    /// `Strict-Transport-Security: max-age=31536000`, including those of a
+    /// router nested in a host application and of a dashboard without
+    /// authentication. A browser that sees it refuses plain HTTP to the whole
+    /// host name, on every port, for a year. If that host name must keep
+    /// serving plain HTTP elsewhere, keep this `true` and have the host
+    /// application remove that header from the nested router's responses:
+    /// `false` also drops `Secure` from the session cookie, which a browser
+    /// then sends over plain HTTP to the same host.
     ///
     /// ```no_run
     /// # fn dashboard(queue: pgqueue::Queue) -> Result<axum::Router, pgqueue::Error> {
@@ -2178,6 +2206,9 @@ pub(crate) async fn retry_job(
         .map_err(|error| {
             action_error(error, "the job or its dedupe key is locked by another transaction; try again")
         })?;
+    if job_id.is_none() {
+        require_job(&queue, id).await?;
+    }
     Ok(Json(json!({ "retried": job_id.is_some(), "job_id": job_id })).into_response())
 }
 
@@ -2194,7 +2225,21 @@ pub(crate) async fn abort_job(
         .abort_within(id, "aborted from dashboard", state.action_deadline(deadline))
         .await
         .map_err(|error| action_error(error, "the job is locked by another transaction; try again"))?;
+    if !aborted {
+        require_job(&queue, id).await?;
+    }
     Ok(Json(json!({ "aborted": aborted })).into_response())
+}
+
+/// Answers a declined action on a job that no longer exists — purged by retention between the page's render and the
+/// click — as the `404` a read of it gets. A `false` there read as a refusal on account of the job's state, which the
+/// page then explained with causes that could not apply to a job that is gone.
+async fn require_job(queue: &Queue, id: Uuid) -> Result<(), DashboardApiError> {
+    if queue.database().dashboard_job_exists(id).await? {
+        Ok(())
+    } else {
+        Err(DashboardApiError::NotFound("job not found"))
+    }
 }
 
 /// What an action answers when the bound [`ActionDeadline`] puts on its lock waits ended it, which leaves the job
@@ -2607,16 +2652,24 @@ const CREDENTIAL_REQUEST_BODY_LIMIT: usize = 8 * 1024;
 const SITE_HEADER: &str = "sec-fetch-site";
 const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_SESSIONS: usize = 64;
-const AUTH_FAILURE_DELAY: Duration = Duration::from_millis(100);
-/// How often one credential comparison is handed back to the account, and how
-/// many an idle account may spend at once. Together they cap guessing at ten a
-/// second sustained — the delay above only ever made *one* guess slow.
+/// How often one credential comparison is handed back to a client, and how
+/// many an idle client may spend at once. Together they cap one client's
+/// guessing at ten a second sustained on each [`AuthChannel`].
 const AUTH_ATTEMPT_REFILL: Duration = Duration::from_millis(100);
 const AUTH_ATTEMPT_BURST: u32 = 16;
+/// The same pair for an IPv6 /48 as a whole, which every /64 client within it
+/// also spends from: four clients' worth (see [`AuthClient::network`]).
+const AUTH_NETWORK_REFILL: Duration = Duration::from_millis(25);
+const AUTH_NETWORK_BURST: u32 = 64;
 /// How many client/channel budgets are tracked at once. Bounds what a client
 /// hopping addresses can make this process allocate; see
 /// [`make_room_for_a_bucket`] for what gives way when it is reached.
 const MAX_AUTH_CLIENTS: usize = 1_024;
+/// The same bound for the /48 budgets, whose clients are far fewer.
+const MAX_AUTH_NETWORKS: usize = 256;
+/// How often failed and refused credential checks are reported in the log, counted across every client (see
+/// [`AuthThrottle::record_failure`]): the first at once, then at most one report a minute, however many clients.
+const AUTH_THROTTLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const AUTH_SATURATED_MESSAGE: &str = "too many authentication attempts";
 
 enum CredentialCheck {
@@ -2631,7 +2684,7 @@ struct DashboardCredentials {
 }
 
 struct DashboardSession {
-    expires_at: Instant,
+    expires_at: tokio::time::Instant,
     credential_revision: Uuid,
 }
 
@@ -2647,7 +2700,7 @@ enum PasswordRotation {
     /// authenticated by a session cookie, and `None` when it came in over HTTP
     /// Basic and so has no session to re-issue.
     Changed {
-        session: Option<(String, Instant)>,
+        session: Option<(String, tokio::time::Instant)>,
     },
     StaleCredentials,
     Unavailable,
@@ -2705,8 +2758,8 @@ enum AuthClient {
 /// on an API request, so that is the flood surface; the login form is the only
 /// way an operator who holds no session can get in. Sharing one budget meant an
 /// unauthenticated flood on the API locked the operator out of the form, which
-/// is a denial of service rather than a throttle. Each budget is still the same
-/// size, so neither channel is easier to guess at than before.
+/// is a denial of service rather than a throttle. The price is that a client
+/// guessing on both channels gets both budgets: twice the rate of either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AuthChannel {
     /// HTTP Basic credentials on a protected route.
@@ -2724,16 +2777,14 @@ struct AuthThrottleKey {
 /// A token bucket per client and channel over the credential comparisons this
 /// dashboard performs.
 ///
-/// [`AUTH_FAILURE_DELAY`] bounds the latency of a single rejection, not the
-/// rate of rejections: concurrent guesses were compared as fast as the network
-/// could deliver them, because the comparison happened before anything
-/// throttled it. Spending budget *first* bounds the rate instead, and — because
-/// an exhausted budget refuses the attempt without comparing anything — a
-/// correct password is then refused exactly like a wrong one, leaving no
-/// 303-versus-429 oracle to guess against.
+/// The budget is spent *before* anything is compared, which bounds the rate of
+/// guesses, and — because an exhausted budget refuses the attempt without
+/// comparing anything — a correct password is then refused exactly like a wrong
+/// one, leaving no 303-versus-429 oracle to guess against.
 ///
-/// The budget is spent before the first `await`, so a client that cancels its
-/// request mid-check has already paid for the attempt.
+/// Spending, comparing and refunding are one synchronous step (see
+/// [`DashboardAuthState::check`]), so a client cannot cancel its request between
+/// paying for an attempt and having it compared.
 ///
 /// A comparison that *matches* hands its token straight back. A legitimate
 /// client polling the JSON API over HTTP Basic would otherwise throttle itself
@@ -2744,18 +2795,36 @@ struct AuthThrottleKey {
 /// most: an unauthenticated flood — which never gets a refund, having nothing
 /// that matches — held the only budget at zero and refused the operator's
 /// correct password for as long as it ran, with no reset short of a restart.
+///
+/// An IPv6 client also spends from its /48's bucket in `networks`, which
+/// bounds what holding many /64s is worth (see [`AuthClient::network`]). The
+/// two maps are only ever locked in that order: `buckets`, then `networks`.
 struct AuthThrottle {
     buckets: Mutex<HashMap<AuthThrottleKey, AuthThrottleTokens>>,
+    networks: Mutex<HashMap<AuthThrottleKey, AuthThrottleTokens>>,
+    failures: Mutex<AuthFailureTally>,
+}
+
+/// A bucket's size and refill rate: [`AuthThrottleTokens::CLIENT`] for a
+/// client, [`AuthThrottleTokens::NETWORK`] for an IPv6 /48.
+#[derive(Clone, Copy)]
+struct AuthBudget {
+    burst: u32,
+    refill: Duration,
 }
 
 struct AuthThrottleTokens {
     available: u32,
     refilled_at: tokio::time::Instant,
+    budget: AuthBudget,
 }
 
 impl AuthThrottleTokens {
-    fn full(now: tokio::time::Instant) -> Self {
-        Self { available: AUTH_ATTEMPT_BURST, refilled_at: now }
+    const CLIENT: AuthBudget = AuthBudget { burst: AUTH_ATTEMPT_BURST, refill: AUTH_ATTEMPT_REFILL };
+    const NETWORK: AuthBudget = AuthBudget { burst: AUTH_NETWORK_BURST, refill: AUTH_NETWORK_REFILL };
+
+    fn full(now: tokio::time::Instant, budget: AuthBudget) -> Self {
+        Self { available: budget.burst, refilled_at: now, budget }
     }
 
     /// The bucket a key arriving into a full map starts with: what the bucket
@@ -2765,39 +2834,84 @@ impl AuthThrottleTokens {
     /// holds every bucket at zero is still heard — and a correct password hands
     /// that comparison straight back and leaves with a session cookie, which is
     /// not throttled at all.
-    fn arriving(now: tokio::time::Instant, displaced: Option<u32>) -> Self {
+    fn arriving(now: tokio::time::Instant, displaced: Option<u32>, budget: AuthBudget) -> Self {
         match displaced {
-            Some(available) => Self { available: available.max(1), refilled_at: now },
-            None => Self::full(now),
+            Some(available) => Self { available: available.max(1), refilled_at: now, budget },
+            None => Self::full(now, budget),
         }
     }
 
+    fn is_full(&self) -> bool {
+        self.available >= self.budget.burst
+    }
+
     fn refill(&mut self, now: tokio::time::Instant) {
-        let elapsed = now.saturating_duration_since(self.refilled_at).as_nanos() / AUTH_ATTEMPT_REFILL.as_nanos();
-        let headroom = u128::from(AUTH_ATTEMPT_BURST - self.available);
+        let elapsed = now.saturating_duration_since(self.refilled_at).as_nanos() / self.budget.refill.as_nanos();
+        let headroom = u128::from(self.budget.burst - self.available);
         if elapsed >= headroom {
             // Time past a full bucket is not banked — a client nobody heard from
             // all day is still worth exactly one burst — and resetting the mark
             // keeps the interval arithmetic small.
-            self.available = AUTH_ATTEMPT_BURST;
+            self.available = self.budget.burst;
             self.refilled_at = now;
         } else if elapsed > 0 {
             // Still filling, so carry the sub-interval remainder instead of
             // rounding it away on every attempt.
             let refill = elapsed as u32;
             self.available += refill;
-            self.refilled_at += AUTH_ATTEMPT_REFILL * refill;
+            self.refilled_at += self.budget.refill * refill;
         }
     }
+
+    fn refund(&mut self) {
+        self.available = self.available.saturating_add(1).min(self.budget.burst);
+    }
+}
+
+/// The failed and refused credential checks since the last report, across every client.
+#[derive(Default)]
+struct AuthFailureTally {
+    failed: u64,
+    refused: u64,
+    /// The distinct clients among them, up to [`MAX_AUTH_CLIENTS`].
+    clients: HashSet<AuthClient>,
+    reported_at: Option<tokio::time::Instant>,
+}
+
+/// What [`AuthThrottle::record_failure`] reports: the checks since the previous report.
+#[derive(Debug, PartialEq, Eq)]
+struct AuthFailureReport {
+    failed: u64,
+    refused: u64,
+    clients: usize,
+}
+
+/// The bucket for `key` in `buckets`, made room for and refilled.
+fn auth_bucket(
+    buckets: &mut HashMap<AuthThrottleKey, AuthThrottleTokens>,
+    key: AuthThrottleKey,
+    now: tokio::time::Instant,
+    limit: usize,
+    budget: AuthBudget,
+) -> &mut AuthThrottleTokens {
+    let displaced = if buckets.contains_key(&key) { None } else { make_room_for_a_bucket(buckets, now, limit) };
+    let tokens = buckets.entry(key).or_insert_with(|| AuthThrottleTokens::arriving(now, displaced, budget));
+    tokens.refill(now);
+    tokens
 }
 
 impl AuthThrottle {
     fn new() -> Self {
-        Self { buckets: Mutex::new(HashMap::new()) }
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            networks: Mutex::new(HashMap::new()),
+            failures: Mutex::new(AuthFailureTally::default()),
+        }
     }
 
-    /// Spends one comparison from `key`'s budget, reporting `false` once that
-    /// budget is exhausted.
+    /// Spends one comparison from `key`'s budget, and from its network's for an
+    /// IPv6 client, reporting `false` once either is exhausted. A refused
+    /// attempt spends from neither.
     fn spend(&self, key: AuthThrottleKey) -> bool {
         let Ok(mut buckets) = self.buckets.lock() else {
             // Refuse rather than admit an unmetered attempt: the lock is only
@@ -2807,11 +2921,20 @@ impl AuthThrottle {
             return false;
         };
         let now = tokio::time::Instant::now();
-        let displaced = if buckets.contains_key(&key) { None } else { make_room_for_a_bucket(&mut buckets, now) };
-        let tokens = buckets.entry(key).or_insert_with(|| AuthThrottleTokens::arriving(now, displaced));
-        tokens.refill(now);
+        let tokens = auth_bucket(&mut buckets, key, now, MAX_AUTH_CLIENTS, AuthThrottleTokens::CLIENT);
         if tokens.available == 0 {
             return false;
+        }
+        if let Some(network) = key.network() {
+            let Ok(mut networks) = self.networks.lock() else {
+                tracing::error!("dashboard authentication throttle lock poisoned");
+                return false;
+            };
+            let network = auth_bucket(&mut networks, network, now, MAX_AUTH_NETWORKS, AuthThrottleTokens::NETWORK);
+            if network.available == 0 {
+                return false;
+            }
+            network.available -= 1;
         }
         tokens.available -= 1;
         true
@@ -2825,14 +2948,78 @@ impl AuthThrottle {
     /// fullest *still-spent* one — whose refund is genuinely lost. Losing one
     /// only ever errs toward throttling, and the client's next arrival is
     /// granted a comparison regardless.
-    fn refund(&self, key: AuthThrottleKey) {
+    ///
+    /// Reports whether the client's budget still shows attempts it spent
+    /// before this one. A matching comparison always hands its token back, so
+    /// only failed ones leave that mark: this match came after failed guesses.
+    fn refund(&self, key: AuthThrottleKey) -> bool {
         let Ok(mut buckets) = self.buckets.lock() else {
             tracing::error!("dashboard authentication throttle lock poisoned");
-            return;
+            return false;
         };
-        if let Some(tokens) = buckets.get_mut(&key) {
-            tokens.available = tokens.available.saturating_add(1).min(AUTH_ATTEMPT_BURST);
+        let after_failures = buckets.get_mut(&key).is_some_and(|tokens| {
+            tokens.refund();
+            tokens.available < tokens.budget.burst
+        });
+        if let Some(network) = key.network() {
+            let Ok(mut networks) = self.networks.lock() else {
+                tracing::error!("dashboard authentication throttle lock poisoned");
+                return after_failures;
+            };
+            if let Some(tokens) = networks.get_mut(&network) {
+                tokens.refund();
+            }
         }
+        after_failures
+    }
+
+    /// Counts a failed (`refused == false`) or refused credential check by `client`, and logs the count since the
+    /// previous report: the first at once, then at most one report per [`AUTH_THROTTLE_LOG_INTERVAL`].
+    ///
+    /// Counted across every client because the budgets bound each client alone: guessing spread over many
+    /// addresses, each staying within its budget, is refused nowhere and would otherwise leave no trace. A client is
+    /// counted by its throttle key, so an IPv6 client is its /64. Logged after the lock is released, so a logging
+    /// failure cannot poison it.
+    fn record_failure(&self, client: AuthClient, refused: bool) {
+        if let Some(report) = self.tally_failure(client, refused, tokio::time::Instant::now()) {
+            tracing::warn!(
+                failed = report.failed,
+                refused = report.refused,
+                clients = report.clients,
+                "dashboard credential checks failed or were refused since the last report"
+            );
+        }
+    }
+
+    fn tally_failure(&self, client: AuthClient, refused: bool, now: tokio::time::Instant) -> Option<AuthFailureReport> {
+        let Ok(mut tally) = self.failures.lock() else {
+            tracing::error!("dashboard authentication failure tally lock poisoned");
+            return None;
+        };
+        if refused {
+            tally.refused += 1;
+        } else {
+            tally.failed += 1;
+        }
+        if tally.clients.len() < MAX_AUTH_CLIENTS {
+            tally.clients.insert(client);
+        }
+        if tally.reported_at.is_some_and(|at| now.saturating_duration_since(at) < AUTH_THROTTLE_LOG_INTERVAL) {
+            return None;
+        }
+        tally.reported_at = Some(now);
+        let report = AuthFailureReport { failed: tally.failed, refused: tally.refused, clients: tally.clients.len() };
+        tally.failed = 0;
+        tally.refused = 0;
+        tally.clients.clear();
+        Some(report)
+    }
+}
+
+impl AuthThrottleKey {
+    /// The key of the /48 an IPv6 client's budget also draws on, if it has one.
+    fn network(self) -> Option<Self> {
+        self.client.network().map(|client| Self { client, channel: self.channel })
     }
 }
 
@@ -2856,16 +3043,17 @@ impl AuthThrottle {
 fn make_room_for_a_bucket(
     buckets: &mut HashMap<AuthThrottleKey, AuthThrottleTokens>,
     now: tokio::time::Instant,
+    limit: usize,
 ) -> Option<u32> {
-    if buckets.len() < MAX_AUTH_CLIENTS {
+    if buckets.len() < limit {
         return None;
     }
     buckets.retain(|_, tokens| {
         tokens.refill(now);
-        tokens.available < AUTH_ATTEMPT_BURST
+        !tokens.is_full()
     });
     let mut displaced = None;
-    while buckets.len() >= MAX_AUTH_CLIENTS
+    while buckets.len() >= limit
         && let Some((fullest, available)) =
             buckets.iter().max_by_key(|(_, tokens)| tokens.available).map(|(key, tokens)| (*key, tokens.available))
     {
@@ -2887,14 +3075,15 @@ impl AuthClient {
 
     /// The client an address names, with IPv6 folded to its /64.
     ///
-    /// A single IPv6 subscriber is normally handed a whole /64, so an
+    /// A single IPv6 subscriber is normally handed at least a whole /64, so an
     /// individual address is not an identity anyone had to pay for: taking a
     /// fresh one per request costs nothing, and 2^64 of them is enough to cycle
-    /// every bucket out of the map for as long as the flood lasts. The /64 is
-    /// the smallest unit an attacker cannot mint more of. IPv4 addresses are
-    /// scarce and routed one at a time, so they stay whole — folding them to a
-    /// /24 would make unrelated customers of one ISP share a budget, which is
-    /// the lockout this keying exists to avoid.
+    /// every bucket out of the map for as long as the flood lasts. Many are
+    /// handed more — a /56 is common, and a /48 is a site's or a tunnel
+    /// broker's free allocation — which [`AuthClient::network`] bounds. IPv4
+    /// addresses are scarce and routed one at a time, so they stay whole —
+    /// folding them to a /24 would make unrelated customers of one ISP share a
+    /// budget, which is the lockout this keying exists to avoid.
     fn peer(address: std::net::IpAddr) -> Self {
         // An IPv4 client arriving on a dual-stack socket is mapped into IPv6
         // (`::ffff:a.b.c.d`); folding *that* to a /64 would put every such
@@ -2906,6 +3095,27 @@ impl AuthClient {
                 Self::Peer(std::net::Ipv6Addr::from(octets).into())
             }
             canonical => Self::Peer(canonical),
+        }
+    }
+
+    /// The /48 an IPv6 client's /64 belongs to, whose budget it also spends from.
+    ///
+    /// Without it, every /64 a holder of a /56 or a /48 owns was a client of its
+    /// own, each with a full budget and each granted a comparison on arrival
+    /// however full the map, so guessing from one routed /48 was bounded only
+    /// by what the server could answer. A /48 is often one site, but providers
+    /// also carve many subscribers' prefixes out of one, so a client can share
+    /// this budget with an attacker who is a stranger to it, and be refused
+    /// while the attacker spends it; that budget is four clients' worth to make
+    /// it harder to spend. IPv4 clients and [`AuthClient::Any`] have none.
+    fn network(self) -> Option<Self> {
+        match self {
+            Self::Peer(std::net::IpAddr::V6(address)) => {
+                let mut octets = address.octets();
+                octets[6..].fill(0);
+                Some(Self::Peer(std::net::Ipv6Addr::from(octets).into()))
+            }
+            Self::Peer(std::net::IpAddr::V4(_)) | Self::Any => None,
         }
     }
 }
@@ -3098,23 +3308,36 @@ impl DashboardAuthState {
         constant_time_eq(supplied, expected.as_bytes()).then_some(credentials.revision)
     }
 
-    async fn check_credentials(&self, client: AuthClient, username: &str, password: &str) -> CredentialCheck {
-        self.check(AuthChannel::Interactive, client, || self.credentials_match(username, password)).await
+    fn check_credentials(&self, client: AuthClient, username: &str, password: &str) -> CredentialCheck {
+        self.check(AuthChannel::Interactive, client, || self.credentials_match(username, password))
     }
 
-    async fn check_basic_credentials(&self, client: AuthClient, headers: &HeaderMap) -> CredentialCheck {
+    fn check_basic_credentials(&self, client: AuthClient, headers: &HeaderMap) -> CredentialCheck {
         // A header carrying no Basic credential is refused without spending
         // budget: there is nothing to compare, so letting it through would let
         // any anonymous client hold the throttle saturated for everyone else.
         let Some(supplied) = basic_credentials(headers) else {
             return CredentialCheck::Rejected;
         };
-        self.check(AuthChannel::Basic, client, || self.basic_credentials_match(supplied)).await
+        self.check(AuthChannel::Basic, client, || self.basic_credentials_match(supplied))
     }
 
     /// Spends one attempt from this client's budget for this channel and, if
     /// there was one to spend, compares the supplied credentials.
-    async fn check(
+    ///
+    /// Synchronous on purpose: a rejection answers at once. It used to wait a
+    /// tenth of a second first, inside the standalone server's request limit, so
+    /// every wrong password held one of its request slots for that long — 64
+    /// clients guessing within their budgets held all 128 and left the operator's
+    /// own requests queued behind them.
+    ///
+    /// The budgets bound guessing per client, not in total: an attacker with many
+    /// addresses gets each address's budget, up to what the server can answer.
+    /// That is why every failed or refused check is counted across clients and
+    /// reported (see [`AuthThrottle::record_failure`]), why a match after failed
+    /// guesses is logged, and why the password should be one no number of
+    /// guesses finds.
+    fn check(
         &self,
         channel: AuthChannel,
         client: AuthClient,
@@ -3122,21 +3345,22 @@ impl DashboardAuthState {
     ) -> CredentialCheck {
         let key = AuthThrottleKey { client, channel };
         if !self.throttle.spend(key) {
+            self.throttle.record_failure(client, true);
             return CredentialCheck::Saturated;
         }
         if let Some(revision) = compare() {
-            self.throttle.refund(key);
+            if self.throttle.refund(key) {
+                tracing::warn!(client = ?client, channel = ?channel, "dashboard credentials accepted after failed attempts");
+            }
             return CredentialCheck::Accepted(revision);
         }
-        // The delay makes one guess expensive; the budget above is what makes a
-        // million of them expensive.
-        tokio::time::sleep(AUTH_FAILURE_DELAY).await;
+        self.throttle.record_failure(client, false);
         CredentialCheck::Rejected
     }
 
     fn create_session(&self, credential_revision: Uuid) -> SessionCreation {
         let token = random_session_token();
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let Ok(credentials) = self.credentials.read() else {
             tracing::error!("dashboard password lock poisoned");
             return SessionCreation::Unavailable;
@@ -3166,7 +3390,7 @@ impl DashboardAuthState {
     }
 
     fn session_is_valid(&self, headers: &HeaderMap) -> bool {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let Ok(credentials) = self.credentials.read() else {
             tracing::error!("dashboard password lock poisoned");
             return false;
@@ -3211,7 +3435,7 @@ impl DashboardAuthState {
         let revision = Uuid::now_v7();
         credentials.password = new_password;
         credentials.revision = revision;
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         // Every token minted under the old password dies, the caller's
         // included: an admin who changes the password because a token may have
         // leaked would otherwise leave the one token worth rotating — the one
@@ -3295,7 +3519,7 @@ async fn require_auth(
     }
     if supplied_authorization {
         let client = auth.client_of(request.headers(), request.extensions());
-        match auth.check_basic_credentials(client, request.headers()).await {
+        match auth.check_basic_credentials(client, request.headers()) {
             CredentialCheck::Accepted(_) => return next.run(request).await,
             CredentialCheck::Rejected => {}
             CredentialCheck::Saturated => {
@@ -3338,7 +3562,7 @@ async fn login(
     if is_cross_site_post(&headers, &uri) {
         return (StatusCode::FORBIDDEN, Html(auth.login_html("Cross-site login posts are refused."))).into_response();
     }
-    let credential_revision = match auth.check_credentials(client, &form.username, &form.password).await {
+    let credential_revision = match auth.check_credentials(client, &form.username, &form.password) {
         CredentialCheck::Accepted(revision) => revision,
         CredentialCheck::Rejected => {
             return (StatusCode::UNAUTHORIZED, Html(auth.login_html("Invalid username or password."))).into_response();
@@ -3364,6 +3588,7 @@ async fn login(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    tracing::info!(client = ?client, "dashboard sign-in");
     redirect_response(
         &auth.home_path(),
         Some(&session_cookie(&auth.session_cookie_name, &token, auth.secure_cookies, auth.cookie_path())),
@@ -3387,7 +3612,7 @@ async fn change_password(
     if change.new_password.len() > MAX_CREDENTIAL_BYTES {
         return Err(DashboardApiError::BadRequest("new password is too long"));
     }
-    let credential_revision = match auth.check_credentials(client, &auth.username, &change.current_password).await {
+    let credential_revision = match auth.check_credentials(client, &auth.username, &change.current_password) {
         CredentialCheck::Accepted(revision) => revision,
         CredentialCheck::Rejected => {
             return Err(DashboardApiError::Forbidden("current password is incorrect"));
@@ -3398,6 +3623,7 @@ async fn change_password(
     };
     match auth.rotate_password(credential_revision, change.new_password, &headers) {
         PasswordRotation::Changed { session } => {
+            tracing::info!(client = ?client, "dashboard password changed");
             let mut response = Json(json!({ "changed": true })).into_response();
             if let Some((token, expires_at)) = session {
                 // The re-minted session inherits the old one's server-side
@@ -3409,7 +3635,7 @@ async fn change_password(
                     &format!("{}={token}", auth.session_cookie_name),
                     auth.secure_cookies,
                     auth.cookie_path(),
-                    Some(expires_at.saturating_duration_since(Instant::now()).as_secs()),
+                    Some(expires_at.saturating_duration_since(tokio::time::Instant::now()).as_secs()),
                 );
                 let Ok(cookie) = HeaderValue::from_str(&cookie) else {
                     tracing::error!("invalid dashboard session cookie");
@@ -3610,7 +3836,10 @@ mod dashboard_auth_tests {
         let token = random_session_token();
         sessions.insert(
             token.clone(),
-            DashboardSession { expires_at: Instant::now() + SESSION_TTL, credential_revision: Uuid::now_v7() },
+            DashboardSession {
+                expires_at: tokio::time::Instant::now() + SESSION_TTL,
+                credential_revision: Uuid::now_v7(),
+            },
         );
         assert_eq!(stored_session_key(&sessions, &token).as_deref(), Some(token.as_str()));
         let near_miss = format!("{}0", &token[..token.len() - 1]);
@@ -3839,29 +4068,70 @@ mod dashboard_auth_tests {
         AuthThrottleKey { client, channel: AuthChannel::Interactive }
     }
 
-    /// Real time, not paused: every assertion below runs in microseconds, while
-    /// handing an attempt back takes [`AUTH_ATTEMPT_REFILL`] — and a paused
-    /// clock auto-advances past exactly that while a cancelled task settles.
-    #[tokio::test]
-    async fn test_cancelled_credential_check_still_spends_its_attempt_budget() {
+    fn created_session(auth: &DashboardAuthState) -> String {
+        let revision = auth.credentials.read().unwrap().revision;
+        match auth.create_session(revision) {
+            SessionCreation::Created(token) => token,
+            _ => panic!("the session was not created"),
+        }
+    }
+
+    fn session_headers(auth: &DashboardAuthState, token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let cookie = HeaderValue::from_str(&format!("{}={token}", auth.session_cookie_name)).unwrap();
+        headers.insert(header::COOKIE, cookie);
+        headers
+    }
+
+    /// A session lasts exactly its TTL, after which its cookie is refused and the session pruned. A stolen cookie
+    /// would otherwise stay good until the process restarted. Paused, so the TTL passes without the twelve hours.
+    #[tokio::test(start_paused = true)]
+    async fn test_session_is_refused_once_its_ttl_has_passed() {
+        let auth = test_auth_state();
+        let token = created_session(&auth);
+        tokio::time::advance(SESSION_TTL - Duration::from_secs(1)).await;
+        assert!(auth.session_is_valid(&session_headers(&auth, &token)));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!auth.session_is_valid(&session_headers(&auth, &token)));
+        assert!(auth.sessions.lock().unwrap().is_empty(), "the expired session is pruned");
+    }
+
+    /// Past the cap, a new session retires the oldest one rather than being refused, so an operator signing in from
+    /// one more browser is never locked out, and expired sessions do not count against the cap.
+    #[tokio::test(start_paused = true)]
+    async fn test_session_cap_retires_the_oldest_session() {
+        let auth = test_auth_state();
+        let expired = created_session(&auth);
+        tokio::time::advance(SESSION_TTL).await;
+        let mut tokens = Vec::new();
+        for _ in 0..MAX_SESSIONS {
+            tokens.push(created_session(&auth));
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert!(!auth.session_is_valid(&session_headers(&auth, &expired)));
+        assert!(auth.session_is_valid(&session_headers(&auth, &tokens[0])), "the expired session took no slot");
+
+        let newest = created_session(&auth);
+        assert!(!auth.session_is_valid(&session_headers(&auth, &tokens[0])), "the oldest session is retired");
+        for token in tokens[1..].iter().chain([&newest]) {
+            assert!(auth.session_is_valid(&session_headers(&auth, token)));
+        }
+        assert_eq!(auth.sessions.lock().unwrap().len(), MAX_SESSIONS);
+    }
+
+    /// Each wrong password spends one attempt and is refused there and then, so a
+    /// burst of them saturates the budget without any of them waiting. Paused, so
+    /// no refill lands mid-test.
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_credential_check_spends_one_attempt_and_answers_at_once() {
         let auth = test_auth_state();
         let client = test_client(1);
-        let attempt_auth = auth.clone();
-        let attempt = tokio::spawn(async move { attempt_auth.check_credentials(client, "admin", "incorrect").await });
-        tokio::task::yield_now().await;
-
-        assert!(!attempt.is_finished());
-        attempt.abort();
-        match attempt.await {
-            Err(error) => assert!(error.is_cancelled()),
-            Ok(_) => panic!("failed credential check completed before cancellation"),
+        let started = tokio::time::Instant::now();
+        for _ in 0..AUTH_ATTEMPT_BURST {
+            assert!(matches!(auth.check_credentials(client, "admin", "incorrect"), CredentialCheck::Rejected));
         }
-        // The budget is spent before the first await, so cancelling the request
-        // that spent it buys nothing: only time hands attempts back.
-        for _ in 1..AUTH_ATTEMPT_BURST {
-            assert!(auth.throttle.spend(interactive(client)));
-        }
-        assert!(!auth.throttle.spend(interactive(client)), "the cancelled attempt kept the budget it spent");
+        assert!(matches!(auth.check_credentials(client, "admin", "password"), CredentialCheck::Saturated));
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test]
@@ -3871,7 +4141,7 @@ mod dashboard_auth_tests {
         // A correct password hands its own attempt straight back, so guessing
         // is what draws the budget down.
         for _ in 0..AUTH_ATTEMPT_BURST {
-            assert!(matches!(auth.check_credentials(client, "admin", "password").await, CredentialCheck::Accepted(_)));
+            assert!(matches!(auth.check_credentials(client, "admin", "password"), CredentialCheck::Accepted(_)));
         }
         for _ in 0..AUTH_ATTEMPT_BURST {
             assert!(auth.throttle.spend(interactive(client)));
@@ -3879,8 +4149,8 @@ mod dashboard_auth_tests {
 
         // No comparison happens at all now, so the correct password is refused
         // exactly like a wrong one: the reply says nothing about the guess.
-        assert!(matches!(auth.check_credentials(client, "admin", "password").await, CredentialCheck::Saturated));
-        assert!(matches!(auth.check_credentials(client, "admin", "incorrect").await, CredentialCheck::Saturated));
+        assert!(matches!(auth.check_credentials(client, "admin", "password"), CredentialCheck::Saturated));
+        assert!(matches!(auth.check_credentials(client, "admin", "incorrect"), CredentialCheck::Saturated));
     }
 
     /// The client whose guessing spent a budget is the only one refused: a
@@ -3892,26 +4162,21 @@ mod dashboard_auth_tests {
         let attacker = test_client(1);
         let operator = test_client(2);
 
-        // Drawn down the way a flood of wrong guesses draws it down, without
-        // paying [`AUTH_FAILURE_DELAY`] for each one — which would hand the
-        // bucket a refill per guess and never saturate it.
+        // Drawn down the way a flood of wrong guesses draws it down.
         for _ in 0..AUTH_ATTEMPT_BURST {
             assert!(auth.throttle.spend(interactive(attacker)));
         }
-        assert!(matches!(auth.check_credentials(attacker, "admin", "password").await, CredentialCheck::Saturated));
+        assert!(matches!(auth.check_credentials(attacker, "admin", "password"), CredentialCheck::Saturated));
 
-        assert!(matches!(auth.check_credentials(operator, "admin", "password").await, CredentialCheck::Accepted(_)));
+        assert!(matches!(auth.check_credentials(operator, "admin", "password"), CredentialCheck::Accepted(_)));
         // And an anonymous flood with no address at all — everything behind one
         // proxy, or a router nested without connection info — cannot spend the
         // budget of a client that has one either.
         for _ in 0..AUTH_ATTEMPT_BURST {
             assert!(auth.throttle.spend(interactive(AuthClient::Any)));
         }
-        assert!(matches!(
-            auth.check_credentials(AuthClient::Any, "admin", "password").await,
-            CredentialCheck::Saturated
-        ));
-        assert!(matches!(auth.check_credentials(operator, "admin", "password").await, CredentialCheck::Accepted(_)));
+        assert!(matches!(auth.check_credentials(AuthClient::Any, "admin", "password"), CredentialCheck::Saturated));
+        assert!(matches!(auth.check_credentials(operator, "admin", "password"), CredentialCheck::Accepted(_)));
     }
 
     /// Basic-auth traffic is anybody's to send, so it must not be able to spend
@@ -3927,8 +4192,8 @@ mod dashboard_auth_tests {
         for _ in 0..AUTH_ATTEMPT_BURST {
             assert!(auth.throttle.spend(AuthThrottleKey { client, channel: AuthChannel::Basic }));
         }
-        assert!(matches!(auth.check_basic_credentials(client, &headers).await, CredentialCheck::Saturated));
-        assert!(matches!(auth.check_credentials(client, "admin", "password").await, CredentialCheck::Accepted(_)));
+        assert!(matches!(auth.check_basic_credentials(client, &headers), CredentialCheck::Saturated));
+        assert!(matches!(auth.check_credentials(client, "admin", "password"), CredentialCheck::Accepted(_)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -4010,6 +4275,70 @@ mod dashboard_auth_tests {
         assert!(!throttle.spend(arriving));
     }
 
+    /// Failed and refused checks are reported across every client: the first at once, then what accumulated, at most
+    /// once a minute. Guessing spread over many clients, each within its budget, is refused nowhere, so a report per
+    /// client would never fire for it.
+    #[tokio::test(start_paused = true)]
+    async fn test_auth_throttle_reports_failures_across_clients_once_a_minute() {
+        let throttle = AuthThrottle::new();
+        let now = tokio::time::Instant::now();
+        let first = throttle.tally_failure(test_client(1), false, now);
+        assert_eq!(first, Some(AuthFailureReport { failed: 1, refused: 0, clients: 1 }));
+        for last in 2..=200 {
+            assert_eq!(throttle.tally_failure(test_client(last), false, now + Duration::from_secs(1)), None);
+        }
+        assert_eq!(throttle.tally_failure(test_client(2), true, now + Duration::from_secs(59)), None);
+        let next = throttle.tally_failure(test_client(3), false, now + AUTH_THROTTLE_LOG_INTERVAL);
+        assert_eq!(next, Some(AuthFailureReport { failed: 200, refused: 1, clients: 199 }));
+    }
+
+    /// A match after failed guesses is the one success worth a warning, and only the failures mark a budget: a client
+    /// whose every check matches hands each token straight back.
+    #[tokio::test(start_paused = true)]
+    async fn test_auth_throttle_tells_a_match_after_failed_guesses() {
+        let throttle = AuthThrottle::new();
+        let key = interactive(test_client(1));
+        assert!(throttle.spend(key));
+        assert!(!throttle.refund(key), "a match with nothing failed before it");
+        assert!(throttle.spend(key));
+        assert!(throttle.spend(key));
+        assert!(throttle.refund(key), "a match after a failed guess");
+    }
+
+    /// Every /64 of a /48 also spends from the /48's budget, so a holder of many
+    /// /64s gets four clients' worth of guesses instead of a full budget per /64,
+    /// while another /48, the other channel, and every IPv4 client keep their own.
+    #[tokio::test(start_paused = true)]
+    async fn test_auth_throttle_charges_an_ipv6_client_to_its_network_too() {
+        let throttle = AuthThrottle::new();
+        let in_network = |index: u16| {
+            interactive(AuthClient::peer(std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, index, 0, 0, 0, 1).into()))
+        };
+        assert_eq!(in_network(7).client.network(), Some(AuthClient::Peer("2001:db8:1::".parse().unwrap())));
+        assert_eq!(test_client(1).network(), None);
+
+        let mut spent = 0;
+        for index in 0..32 {
+            while throttle.spend(in_network(index)) {
+                spent += 1;
+            }
+        }
+        assert_eq!(spent, AUTH_NETWORK_BURST, "the /64s shared one network budget");
+        let elsewhere = interactive(AuthClient::peer("2001:db8:2::1".parse().unwrap()));
+        assert!(throttle.spend(elsewhere), "another /48 has its own budget");
+        assert!(throttle.spend(interactive(test_client(1))), "an IPv4 client has no network to share");
+        let basic = AuthThrottleKey { client: in_network(0).client, channel: AuthChannel::Basic };
+        assert!(throttle.spend(basic), "each channel has its own network budget");
+
+        // A comparison that matched hands the network's token back with the client's.
+        tokio::time::advance(AUTH_NETWORK_REFILL).await;
+        let fresh = in_network(500);
+        assert!(throttle.spend(fresh));
+        assert!(!throttle.spend(in_network(501)), "the refill was spent");
+        throttle.refund(fresh);
+        assert!(throttle.spend(fresh), "the refund returned the network's token");
+    }
+
     /// An IPv6 client is charged to its /64: the whole prefix is normally one
     /// subscriber's, so addresses within it are free to mint and worthless as
     /// identities. IPv4 stays per-address, including the mapped form a
@@ -4039,7 +4368,7 @@ mod dashboard_auth_tests {
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer x"));
 
         for _ in 0..AUTH_ATTEMPT_BURST * 4 {
-            assert!(matches!(auth.check_basic_credentials(client, &headers).await, CredentialCheck::Rejected));
+            assert!(matches!(auth.check_basic_credentials(client, &headers), CredentialCheck::Rejected));
         }
         // A header with nothing to compare cannot be used to hold a budget at
         // zero for the operator who does have credentials.
@@ -4777,6 +5106,16 @@ impl Database {
             .bind(prefix)
             .bind(limit)
             .fetch_all(self.pool())
+            .await?)
+    }
+
+    /// Whether job `id` is in this queue, for an action that declined to say whether it is gone: an existence probe on
+    /// the primary key, which reads none of the bodies [`Database::dashboard_job`] renders.
+    pub(crate) async fn dashboard_job_exists(&self, id: Uuid) -> Result<bool, Error> {
+        Ok(sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM pgqueue.jobs WHERE id = $1 AND queue = $2)")
+            .bind(id)
+            .bind(self.name())
+            .fetch_one(self.pool())
             .await?)
     }
 
