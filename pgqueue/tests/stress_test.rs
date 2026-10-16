@@ -2,7 +2,7 @@
 //!
 //! These are `#[ignore]`d: they run for seconds to tens of seconds each, need a
 //! multi-threaded runtime to produce real contention, and each one creates a
-//! database of its own. Run them with `CI=1 shell/scripts/stress`.
+//! database of its own. Run them with `shell/scripts/stress`.
 //!
 //! Every test here asserts an *invariant* under load rather than a throughput
 //! number, so a pass means the same thing on a busy laptop as on idle CI. The

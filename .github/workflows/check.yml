@@ -42,10 +42,10 @@ jobs:
       - name: Install dev tools
         uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
-          tool: cargo-audit@0.22.2,cargo-llvm-cov@0.8.7,prek@0.5.5,sqlx-cli@0.9.0
+          tool: cargo-audit@0.22.2,cargo-llvm-cov@0.8.7,prek@0.5.5
 
-      # This is the same command the prek commit hook runs locally. `--all-files` hands every tracked file to every
-      # hook, so each one runs whatever files it is scoped to. GitHub Actions sets `CI`, which makes the test and stress
-      # hooks run instead of skipping. Keep every check in prek.toml so local and CI validation cannot drift apart.
+      # The pre-push stage runs every hook, the test suites included, as the prek push hook does locally. `--all-files`
+      # hands every tracked file to every hook, so each one runs whatever files it is scoped to. Keep every check in
+      # prek.toml, and these tool versions equal to the local ones, so local and CI validation cannot drift apart.
       - name: Run repository checks
-        run: prek run --all-files
+        run: prek run --all-files --stage pre-push

@@ -1,8 +1,11 @@
-# Configuration for `prek` (https://prek.j178.dev), run before every commit and in CI.
+# Configuration for `prek` (https://prek.j178.dev), run before every commit and push, and in CI.
 # Schema: https://www.schemastore.org/prek.json
 # 0.5.4 is the first release that reads `hide_status` and `include_deleted` from this file.
 minimum_prek_version = "0.5.4"
-default_install_hook_types = ["pre-commit"]
+# A commit runs every hook except the Rust test suites, which take minutes. A push runs every hook, the suites
+# included, exactly as CI's `prek run --all-files --stage pre-push` does, so a push that passes locally passes CI.
+# Install both with `prek install`.
+default_install_hook_types = ["pre-commit", "pre-push"]
 
 # Hooks run cheapest first and the run stops at the first failure, so a commit that is already going to be rejected
 # never pays for a full test run.
@@ -114,13 +117,14 @@ files = { glob = [
 include_deleted = true
 pass_filenames = false
 
-# The test and stress hooks skip themselves unless `CI` is set, to keep commits under 30 seconds. Besides what clippy
+# The test and stress hooks run on push rather than commit, to keep commits under 30 seconds. Besides what clippy
 # reads, the Rust suite reads the database settings, the embedded dashboard, and its own fixtures.
 [[repos.hooks]]
 id = "test"
 name = "run tests"
 entry = "shell/scripts/test"
 language = "system"
+stages = ["pre-push"]
 files = { glob = [
     "**/*.rs",
     "**/Cargo.toml",
@@ -144,6 +148,7 @@ id = "stress"
 name = "run stress tests"
 entry = "shell/scripts/stress"
 language = "system"
+stages = ["pre-push"]
 files = { glob = [
     "**/*.rs",
     "**/Cargo.toml",

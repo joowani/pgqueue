@@ -2,13 +2,8 @@
 
 set -euo pipefail
 
-# The commit hook has to stay fast, so outside CI the Rust suite runs only on request, as in `CI=1 shell/scripts/test`.
-# The dashboard's JavaScript tests take well under a second, so prek runs them in their own hook on every commit that
-# touches the dashboard.
-if [[ -z ${CI:-} ]]; then
-    echo "test: skipped because CI is not set; run \`CI=1 shell/scripts/test\` to run it locally" >&2
-    exit 0
-fi
+# prek runs this suite on push and in CI, never on commit, which has to stay fast. The dashboard's JavaScript tests take
+# well under a second, so prek runs them in their own hook on every commit that touches the dashboard.
 
 # Source rather than run, to reuse its `DATABASE_URL` and its `cd` to the repository root.
 source "${BASH_SOURCE[0]%/*}/migrate"
@@ -18,7 +13,7 @@ psql "$DATABASE_URL" -Atc "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 ||
 
 # Each SQLx test owns its database, so the cases run in parallel, one per CPU. Tests with timing assertions must leave
 # room for a machine busy with the rest of the suite. Forward arguments so a run can be narrowed, as in
-# `CI=1 shell/scripts/test dedupe`; the coverage floor is for the whole suite, so a narrowed run skips the report. The
+# `shell/scripts/test dedupe`; the coverage floor is for the whole suite, so a narrowed run skips the report. The
 # `#[ignore]`d stress tier runs through `shell/scripts/stress`.
 if (( $# == 0 )); then
     coverage=(--fail-under-lines 90)
