@@ -7,5 +7,5 @@ export DATABASE_URL="${DATABASE_URL:-postgres://pgqueue:pgqueue@localhost:${PGQU
 
 docker compose up -d --wait postgres
 
-# Call `sqlx` directly rather than `cargo sqlx` to skip cargo's startup.
-sqlx migrate run --config pgqueue/sqlx.toml --source pgqueue/migrations
+# Use the library's migration path so databases created by 0.1.0 receive its legacy schema repair too.
+cargo run --locked --quiet --bin pgqueue-migrate

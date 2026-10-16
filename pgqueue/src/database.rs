@@ -2639,12 +2639,30 @@ impl Database {
         };
 
         let stored_occurrence = due;
-        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext(length($2)::text || ':' || $2 || $3))")
+        if through.is_some() {
+            sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext(length($2)::text || ':' || $2 || $3))")
+                .bind(self.dedupe_enqueue_lock_key)
+                .bind(&self.name)
+                .bind(&entry.dedupe_key)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            // A caller's enqueue transaction can hold this key indefinitely. Like the schedule-row claim above,
+            // continuous scheduling skips it so unrelated crons still run and no abandoned wait keeps a pool slot.
+            // A burst has no later tick, so it keeps the blocking acquisition and its fixed publication boundary.
+            let locked = sqlx::query_scalar::<_, bool>(
+                "SELECT pg_try_advisory_xact_lock($1, hashtext(length($2)::text || ':' || $2 || $3))",
+            )
             .bind(self.dedupe_enqueue_lock_key)
             .bind(&self.name)
             .bind(&entry.dedupe_key)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
+            if !locked {
+                tx.rollback().await?;
+                return Ok(DatabaseCronScheduleResult::Contended);
+            }
+        }
         // The dedupe-key lock may have been held by a long caller-owned
         // transaction. Use wall-clock database time after that wait so an
         // occurrence cannot be published after its grace or successor.
@@ -4746,6 +4764,39 @@ async fn take_claim_resolution_lock(
     Ok(true)
 }
 
+/// Bounds each recovery operation on the client too: a silent connection cannot deliver the server's lock or idle
+/// timeout, and a live worker's lease prevents the sweeper from recovering these claims instead. Reset the deadline
+/// between operations so a large batch that keeps making progress can finish. Callers discard failed connections
+/// through SQLx's bounded close-on-drop path instead of its potentially unbounded rollback and ping cleanup.
+async fn recovery_io<T>(
+    operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+) -> Result<T, sqlx::Error> {
+    match tokio::time::timeout(Duration::from_secs(10), operation).await {
+        Ok(result) => result,
+        Err(_) => Err(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "claim recovery database operation timed out",
+        ))),
+    }
+}
+
+/// End recovery's row-lock waits on the server as well. Closing a timed-out client does not cancel a server waiting
+/// behind another transaction, so repeated attempts must not accumulate abandoned waits there. Only lower the
+/// session's own bound, and keep the setting local to this recovery transaction.
+async fn bound_recovery_row_locks(transaction: &mut sqlx::PgTransaction<'_>) -> Result<(), sqlx::Error> {
+    recovery_io(
+        sqlx::query(
+            "SELECT set_config('lock_timeout', $1, true)
+             FROM (SELECT current_setting('lock_timeout')::interval AS configured) setting
+             WHERE configured = interval '0' OR configured > $1::interval",
+        )
+        .bind(format!("{}ms", CLAIM_RESOLUTION_LOCK_WAIT.as_millis()))
+        .execute(&mut **transaction),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Requeues, with an attempt refund, every claim in `claims` that the server
 /// really did commit for `worker_id`, clearing the list once the whole pass
 /// commits so an interrupted pass retries intact. Returns how many rows were
@@ -4767,48 +4818,45 @@ async fn requeue_unacknowledged_claims(
     let mut requeued = 0;
     let mut aborted = 0;
     let mut connection = PoolConnectionGuard::new(context.pool.acquire().await?);
-    let mut transaction = connection.begin_transaction().await?;
-    if !take_claim_resolution_lock(&mut transaction, context.claim_lock_key, worker_id).await? {
-        transaction.rollback().await?;
+    // Keep the connection guard armed through COMMIT, including cancellation after BEGIN succeeds.
+    let mut transaction = recovery_io(connection.connection().begin_with(BEGIN_BOUNDED_TRANSACTION_SQL)).await?;
+    if !recovery_io(take_claim_resolution_lock(&mut transaction, context.claim_lock_key, worker_id)).await? {
+        recovery_io(transaction.rollback()).await?;
+        // Claims remain pending. Even after a successful rollback, a silent release ping could retain the only pool
+        // slot and prevent their next pass from starting, so keep this connection on the bounded close path too.
         return Ok(None);
     }
     // A caller can lock a committed claim's row independently of the claim transaction. Waiting on that row while
     // holding the exclusive resolution lock would refuse every other claim of this live worker indefinitely. Bound
     // the pass's row waits too: a refusal rolls back without clearing `claims`, releasing the gate until the retry.
-    // Transaction-local, and only lowered, so the session's own shorter bound survives and no setting leaks out.
-    sqlx::query(
-        "SELECT set_config('lock_timeout', $1, true)
-         FROM (SELECT current_setting('lock_timeout')::interval AS configured) setting
-         WHERE configured = interval '0' OR configured > $1::interval",
-    )
-    .bind(format!("{}ms", CLAIM_RESOLUTION_LOCK_WAIT.as_millis()))
-    .execute(&mut *transaction)
-    .await?;
+    bound_recovery_row_locks(&mut transaction).await?;
     for claim in claims.iter() {
-        let row = sqlx::query_as::<_, RequeueResult>(REQUEUE_GUARDED_SQL)
-            .bind(claim.id)
-            // The attempt never ran, so its original schedule stands.
-            .bind(0i64)
-            .bind(Some(UNACKNOWLEDGED_CLAIM_ERROR))
-            .bind(claim.attempts)
-            .bind(Some(worker_id))
-            .bind(&context.queue)
-            // Refund: nothing was executed, so nothing was spent.
-            .bind(true)
-            // The row is `running` if the commit landed, or `aborting` under
-            // the sweeper's markers if recovery noticed it first; both are
-            // this worker's to give back.
-            .bind(true)
-            .bind(true)
-            .bind(SWEPT)
-            .bind(swept_marker())
-            .bind(&context.notify_channel)
-            // The worker is alive and healthy — the lost acknowledgement was
-            // the connection's, not the process's — so its intake stays open.
-            .bind(false)
-            .bind(claim.started_at.map(|started_at| started_at.to_sqlx()))
-            .fetch_one(&mut *transaction)
-            .await?;
+        let row = recovery_io(
+            sqlx::query_as::<_, RequeueResult>(REQUEUE_GUARDED_SQL)
+                .bind(claim.id)
+                // The attempt never ran, so its original schedule stands.
+                .bind(0i64)
+                .bind(Some(UNACKNOWLEDGED_CLAIM_ERROR))
+                .bind(claim.attempts)
+                .bind(Some(worker_id))
+                .bind(&context.queue)
+                // Refund: nothing was executed, so nothing was spent.
+                .bind(true)
+                // The row is `running` if the commit landed, or `aborting` under
+                // the sweeper's markers if recovery noticed it first; both are
+                // this worker's to give back.
+                .bind(true)
+                .bind(true)
+                .bind(SWEPT)
+                .bind(swept_marker())
+                .bind(&context.notify_channel)
+                // The worker is alive and healthy — the lost acknowledgement was
+                // the connection's, not the process's — so its intake stays open.
+                .bind(false)
+                .bind(claim.started_at.map(|started_at| started_at.to_sqlx()))
+                .fetch_one(&mut *transaction),
+        )
+        .await?;
         if row.requeued {
             requeued += 1;
         } else {
@@ -4817,21 +4865,22 @@ async fn requeue_unacknowledged_claims(
             // no-ops below — but a refund refused at the attempt ceiling
             // leaves a row this claim still owns, which must finish rather
             // than sit `running` under an owner that never learned of it.
-            if abort_unsettled_claim(
+            if recovery_io(abort_unsettled_claim(
                 &mut transaction,
                 &context.queue,
                 &context.done_channel,
                 Some(worker_id),
                 claim,
                 UNACKNOWLEDGED_CLAIM_ERROR,
-            )
+            ))
             .await?
             {
                 aborted += 1;
             }
         }
     }
-    transaction.commit().await?;
+    recovery_io(transaction.commit()).await?;
+    connection.disarm();
     for _ in 0..aborted {
         context.counters.record_abort();
     }
@@ -5029,43 +5078,47 @@ async fn resolve_dropped_attempt(
     claim: &DatabaseUnacknowledgedClaim,
 ) -> Result<DroppedAttemptResolution, sqlx::Error> {
     let mut connection = PoolConnectionGuard::new(context.pool.acquire().await?);
-    let mut transaction = connection.begin_transaction().await?;
-    let row = sqlx::query_as::<_, RequeueResult>(REQUEUE_GUARDED_SQL)
-        .bind(claim.id)
-        .bind(retry_delay_ms)
-        .bind(Some(DROPPED_ATTEMPT_ERROR))
-        .bind(claim.attempts)
-        .bind(worker_id)
-        .bind(&context.queue)
-        // The attempt was dispatched and may have run arbitrarily far before
-        // the drop, so it is spent, not refunded.
-        .bind(false)
-        .bind(true)
-        .bind(true)
-        .bind(SWEPT)
-        .bind(swept_marker())
-        .bind(&context.notify_channel)
-        .bind(false)
-        .bind(claim.started_at.map(|started_at| started_at.to_sqlx()))
-        .fetch_one(&mut *transaction)
-        .await?;
+    let mut transaction = recovery_io(connection.connection().begin_with(BEGIN_BOUNDED_TRANSACTION_SQL)).await?;
+    bound_recovery_row_locks(&mut transaction).await?;
+    let row = recovery_io(
+        sqlx::query_as::<_, RequeueResult>(REQUEUE_GUARDED_SQL)
+            .bind(claim.id)
+            .bind(retry_delay_ms)
+            .bind(Some(DROPPED_ATTEMPT_ERROR))
+            .bind(claim.attempts)
+            .bind(worker_id)
+            .bind(&context.queue)
+            // The attempt was dispatched and may have run arbitrarily far before
+            // the drop, so it is spent, not refunded.
+            .bind(false)
+            .bind(true)
+            .bind(true)
+            .bind(SWEPT)
+            .bind(swept_marker())
+            .bind(&context.notify_channel)
+            .bind(false)
+            .bind(claim.started_at.map(|started_at| started_at.to_sqlx()))
+            .fetch_one(&mut *transaction),
+    )
+    .await?;
     let resolution = if row.requeued {
         DroppedAttemptResolution::Requeued
-    } else if abort_unsettled_claim(
+    } else if recovery_io(abort_unsettled_claim(
         &mut transaction,
         &context.queue,
         &context.done_channel,
         worker_id,
         claim,
         DROPPED_ATTEMPT_ERROR,
-    )
+    ))
     .await?
     {
         DroppedAttemptResolution::Aborted
     } else {
         DroppedAttemptResolution::Unchanged
     };
-    transaction.commit().await?;
+    recovery_io(transaction.commit()).await?;
+    connection.disarm();
     Ok(resolution)
 }
 

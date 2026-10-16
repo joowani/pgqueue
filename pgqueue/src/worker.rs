@@ -3616,7 +3616,7 @@ impl CronSchedulingState {
             .filter(|(_, ticks)| **ticks >= MAX_CRON_CONTENDED_TICKS)
             .map(|(key, _)| {
                 format!(
-                    "{key}: cron schedule row remained locked for at least \
+                    "{key}: cron schedule row or dedupe key remained locked for at least \
                      {MAX_CRON_CONTENDED_TICKS} consecutive passes"
                 )
             })
@@ -3795,7 +3795,7 @@ async fn schedule_crons_once(
         }
         match scheduled {
             Ok(DatabaseCronScheduleResult::NotDue) => {}
-            // Another transaction holds the schedule row. Ordinarily that is a
+            // Another transaction holds the schedule row or dedupe key. Ordinarily that is a
             // peer's publication and gone within a round trip, which is why the
             // scheduler simply tries again next tick — but an *outside* holder
             // (an operator's `SELECT ... FOR UPDATE`, a session left open in a
@@ -3810,7 +3810,7 @@ async fn schedule_crons_once(
                     tracing::warn!(
                         cron = %entry.template.name,
                         dedupe_key = %entry.dedupe_key,
-                        "cron schedule row is locked by another transaction; occurrence deferred"
+                        "cron schedule row or dedupe key is locked by another transaction; occurrence deferred"
                     );
                 }
             }

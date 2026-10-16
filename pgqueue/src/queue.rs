@@ -232,18 +232,28 @@ impl Default for ListenerProbe {
     }
 }
 
-/// The one-connection pool a listener session is taken from, kept outside the query pool.
+/// A listener's pool, kept outside the query pool. SQLx's asynchronous UNLISTEN cleanup can retain a silent socket,
+/// so allow one replacement while cleanup finishes. Reuse this pool across attempts to bound those retained sockets;
+/// if both slots are stuck, polling covers notifications until a slot becomes available again.
 fn listener_pool(options: &sqlx::postgres::PgConnectOptions) -> PgPool {
-    PgPoolOptions::new().max_connections(1).connect_lazy_with(options.clone())
+    PgPoolOptions::new().max_connections(2).connect_lazy_with(options.clone())
 }
 
 async fn connect_notify_listener(
     pool: &PgPool,
     notify_channel: &str,
     done_channel: &str,
+    timeout: Duration,
 ) -> Result<PgListener, sqlx::Error> {
     let mut listener = PgListener::connect_with(pool).await?;
-    listener.listen_all([notify_channel, done_channel]).await?;
+    // Pool acquisition has its own deadline, but LISTEN runs after it. A connection lost during subscription must
+    // reach the reconnect loop too, instead of waiting forever before the idle-session probe can start.
+    tokio::time::timeout(timeout, listener.listen_all([notify_channel, done_channel])).await.map_err(|_| {
+        sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "notification listener subscription timed out",
+        ))
+    })??;
     listener.eager_reconnect(false);
     Ok(listener)
 }
@@ -260,7 +270,7 @@ impl QueueNotifyListener {
         // slot of a shared pool. Lazy so construction cannot fail on a refused
         // connection.
         let connect_options = (*database.pool().connect_options()).clone();
-        let mut pool = listener_pool(&connect_options);
+        let pool = listener_pool(&connect_options);
         let probe = database.listener_probe();
         let notify_channel = database.notify_channel().to_string();
         let done_channel = database.done_channel().to_string();
@@ -275,7 +285,8 @@ impl QueueNotifyListener {
         let task = tokio::spawn(async move {
             // `None` sends the loop straight to its reconnect arm, so the
             // first subscription and every later one share one code path.
-            let mut listener = match connect_notify_listener(&pool, &notify_channel, &done_channel).await {
+            let mut listener = match connect_notify_listener(&pool, &notify_channel, &done_channel, probe.timeout).await
+            {
                 Ok(listener) => Some(listener),
                 Err(error) => {
                     health_tx.send_replace(Some(error.to_string()));
@@ -293,7 +304,7 @@ impl QueueNotifyListener {
                 // notifications lost while that subscription is rebuilt.
                 let Some(active_listener) = listener.as_mut() else {
                     tokio::time::sleep(reconnect_delay).await;
-                    match connect_notify_listener(&pool, &notify_channel, &done_channel).await {
+                    match connect_notify_listener(&pool, &notify_channel, &done_channel, probe.timeout).await {
                         Ok(reconnected) => {
                             reconnect_delay = LISTENER_RECONNECT_INITIAL_DELAY;
                             listener = Some(reconnected);
@@ -325,11 +336,8 @@ impl QueueNotifyListener {
                     };
                     health_tx.send_replace(Some(error.clone()));
                     listener.take();
-                    // Dropping a listener runs `UNLISTEN *` on its pooled connection before handing it back. On a
-                    // session that will never answer, that statement waits for as long as TCP takes to give up —
-                    // about a quarter of an hour of retransmissions — holding the pool's one slot, and every reconnect
-                    // would queue behind it. The stale pool is left to that task and the reconnect takes a fresh one.
-                    pool = listener_pool(&connect_options);
+                    // UNLISTEN cleanup may keep the silent socket. The pool has one spare slot for replacement;
+                    // further failures wait for capacity instead of accumulating connections in fresh pools.
                     tracing::warn!(
                         queue = %queue_name,
                         %error,
@@ -645,8 +653,9 @@ impl QueueBuilder {
     }
 
     /// Use an existing pool instead of connecting from the URL. A lazily
-    /// started notification listener opens one additional connection without
-    /// occupying a slot in this pool, and so does each worker for the lease it
+    /// started notification listener opens one additional connection, plus one
+    /// replacement if cleanup stalls, without occupying a slot in this pool.
+    /// Each worker also opens one connection for the lease it
     /// renews (see [`QueueBuilder::connections`]); both are opened from the
     /// pool's connect options, without its `after_connect` hook.
     ///
@@ -661,7 +670,8 @@ impl QueueBuilder {
     /// Pool sizing (ignored when [`QueueBuilder::pool`] is used). Defaults:
     /// 2..=10. Connections outside this pool count against the server's own
     /// `max_connections` too, so a process running one worker peaks at
-    /// `max + 3`: a lazily started notification listener; while this process
+    /// `max + 4`: a lazily started notification listener and one replacement
+    /// while a silent listener's cleanup finishes; while this process
     /// holds sweep leadership, the connection carrying the session-scoped
     /// advisory lock, which is taken from the pool and then detached, freeing
     /// the pool slot but not the server's; and, per worker, the connection it
@@ -676,7 +686,7 @@ impl QueueBuilder {
     /// `CONNECTION LIMIT` (or the server's `max_connections`) makes
     /// [`QueueBuilder::connect`] block for that long and then return
     /// `Error::Db(sqlx::Error::PoolTimedOut)`, which names neither the role nor
-    /// the limit. Size `max + 2` per process, plus one per worker, against the
+    /// the limit. Size `max + 3` per process, plus one per worker, against the
     /// limit rather than diagnosing it from that error.
     pub fn connections(mut self, min: u32, max: u32) -> Self {
         self.min_connections = min;

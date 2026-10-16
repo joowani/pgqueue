@@ -1470,7 +1470,7 @@ async fn test_cron_retries_an_occurrence_lost_to_a_vanished_foreign_holder(pool:
 
 //noinspection SqlNoDataSourceInspection
 #[sqlx::test(migrations = "./migrations")]
-async fn test_cron_rechecks_skip_grace_after_waiting_for_the_dedupe_lock(pool: PgPool) {
+async fn test_burst_cron_rechecks_skip_grace_after_waiting_for_the_dedupe_lock(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
     let counter = Arc::new(AtomicU32::new(0));
     // Daily, not hourly: the grace below has to be the only thing bounding
@@ -1505,7 +1505,11 @@ async fn test_cron_rechecks_skip_grace_after_waiting_for_the_dedupe_lock(pool: P
     .await
     .unwrap()
     .to_jiff();
-    let worker = dynamic_worker(db.queue.clone(), &expression, "lock-wait", options, counter.clone());
+    let worker = dynamic_worker_builder(db.queue.clone(), &expression, "lock-wait", options, counter.clone())
+        .burst(true)
+        .dequeue_timeout(Duration::from_millis(100))
+        .build()
+        .unwrap();
     let shutdown = CancellationToken::new();
     let run = tokio::spawn(worker.run_until(shutdown.clone()));
 
@@ -1544,7 +1548,7 @@ async fn test_cron_rechecks_skip_grace_after_waiting_for_the_dedupe_lock(pool: P
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn test_cron_lock_wait_observes_worker_shutdown(pool: PgPool) {
+async fn test_burst_cron_lock_wait_observes_worker_shutdown(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
     let counter = Arc::new(AtomicU32::new(0));
     // Only the expression matters here: this test sets the cursor itself and asserts on shutdown, never on which
@@ -1553,6 +1557,7 @@ async fn test_cron_lock_wait_observes_worker_shutdown(pool: PgPool) {
     // holds, and the `UPDATE` below then waited on that row lock for ever.
     let expression = "0 0 1 1 *".to_owned();
     let options = skip_options(1, Duration::from_secs(60));
+    register_dynamic_schedule(&db, &expression, "shutdown-lock-wait", options, counter.clone()).await;
     let mut transaction = db.queue.pool().begin().await.unwrap();
     db.queue
         .enqueue_in(
@@ -1562,10 +1567,6 @@ async fn test_cron_lock_wait_observes_worker_shutdown(pool: PgPool) {
         .await
         .unwrap();
 
-    let worker = dynamic_worker(db.queue.clone(), &expression, "shutdown-lock-wait", options, counter);
-    let shutdown = CancellationToken::new();
-    let run = tokio::spawn(worker.run_until(shutdown.clone()));
-    wait_for_schedule(&pool, db.queue.name(), "shutdown-lock-wait").await;
     sqlx::query(
         "UPDATE pgqueue.cron_schedules SET next_run_at = now()
          WHERE queue = $1 AND dedupe_key = $2",
@@ -1575,6 +1576,13 @@ async fn test_cron_lock_wait_observes_worker_shutdown(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
+    let worker = dynamic_worker_builder(db.queue.clone(), &expression, "shutdown-lock-wait", options, counter)
+        .burst(true)
+        .dequeue_timeout(Duration::from_millis(100))
+        .build()
+        .unwrap();
+    let shutdown = CancellationToken::new();
+    let run = tokio::spawn(worker.run_until(shutdown.clone()));
     crate::wait_for_dequeue_lock_waiter(&db.queue, true).await;
 
     shutdown.cancel();
@@ -1590,36 +1598,17 @@ async fn test_cron_lock_wait_observes_worker_shutdown(pool: PgPool) {
 async fn test_cron_reconciliation_lock_wait_observes_worker_shutdown(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
     let counter = Arc::new(AtomicU32::new(0));
-    // Only the expression matters here: this test sets the cursor itself and asserts on shutdown, never on which
-    // occurrence was chosen. Yearly, so the schedule comes due only when this test says so: minutely, a boundary
-    // crossed after reconciliation let the scheduler lock the schedule row first and park on the dedupe lock this test
-    // holds, and the `UPDATE` below then waited on that row lock for ever.
+    // Hold the reconciled schedule row directly, so no scheduling pass can release the lock before startup waits.
     let expression = "0 0 1 1 *".to_owned();
     let options = skip_options(1, Duration::from_secs(60));
+    register_dynamic_schedule(&db, &expression, "reconcile-shutdown-lock-wait", options, counter.clone()).await;
     let mut transaction = db.queue.pool().begin().await.unwrap();
-    db.queue
-        .enqueue_in(
-            &mut transaction,
-            dynamic_tick::job(()).dedupe_key("reconcile-shutdown-lock-wait").delay(Duration::from_secs(60)),
-        )
+    sqlx::query("SELECT 1 FROM pgqueue.cron_schedules WHERE queue = $1 AND dedupe_key = $2 FOR UPDATE")
+        .bind(db.queue.name())
+        .bind("reconcile-shutdown-lock-wait")
+        .execute(&mut *transaction)
         .await
         .unwrap();
-
-    let scheduler =
-        dynamic_worker(db.queue.clone(), &expression, "reconcile-shutdown-lock-wait", options, counter.clone());
-    let scheduler_shutdown = CancellationToken::new();
-    let scheduler_run = tokio::spawn(scheduler.run_until(scheduler_shutdown.clone()));
-    wait_for_schedule(&pool, db.queue.name(), "reconcile-shutdown-lock-wait").await;
-    sqlx::query(
-        "UPDATE pgqueue.cron_schedules SET next_run_at = now()
-         WHERE queue = $1 AND dedupe_key = $2",
-    )
-    .bind(db.queue.name())
-    .bind("reconcile-shutdown-lock-wait")
-    .execute(&pool)
-    .await
-    .unwrap();
-    crate::wait_for_dequeue_lock_waiter(&db.queue, true).await;
 
     let starting = dynamic_worker(db.queue.clone(), &expression, "reconcile-shutdown-lock-wait", options, counter);
     let starting_shutdown = CancellationToken::new();
@@ -1635,12 +1624,6 @@ async fn test_cron_reconciliation_lock_wait_observes_worker_shutdown(pool: PgPoo
     tokio::time::timeout(Duration::from_secs(3), starting_run)
         .await
         .expect("starting worker did not stop while cron reconciliation was locked")
-        .unwrap()
-        .unwrap();
-    scheduler_shutdown.cancel();
-    tokio::time::timeout(Duration::from_secs(3), scheduler_run)
-        .await
-        .expect("scheduler did not stop while the cron key remained locked")
         .unwrap()
         .unwrap();
     transaction.rollback().await.unwrap();
@@ -2277,6 +2260,62 @@ async fn reconciliations_waiting_on_a_lock(pool: &PgPool) -> i64 {
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_a_locked_cron_dedupe_key_does_not_hold_back_other_crons(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    let (locked, free) = ("dedupe-locked", "dedupe-free");
+    let builder = || {
+        let options = skip_options(1, Duration::from_secs(60));
+        Worker::builder(db.queue.clone())
+            .schedule_cron_with_options("0 0 1 1 *", dynamic_tick::job(()).dedupe_key(locked), options)
+            .schedule_cron_with_options("0 0 1 1 *", dynamic_tick::job(()).dedupe_key(free), options)
+            .state(Arc::new(AtomicU32::new(0)))
+            .timers(timers())
+            .poll_interval(Duration::from_millis(20))
+    };
+    let shutdown = CancellationToken::new();
+    let run = tokio::spawn(builder().build().unwrap().run_until(shutdown.clone()));
+    wait_for_schedule(&pool, db.queue.name(), locked).await;
+    wait_for_schedule(&pool, db.queue.name(), free).await;
+    stop_worker(shutdown, run).await;
+
+    // A caller-owned publish holds the first cron's dedupe lock until commit, independently of its schedule row.
+    let mut holder = pool.begin().await.unwrap();
+    db.queue
+        .enqueue_in(&mut holder, dynamic_tick::job(()).dedupe_key(locked).delay(Duration::from_secs(60)))
+        .await
+        .unwrap();
+    let held_cursor = set_cron_due(&pool, db.queue.name(), locked, None).await;
+    set_cron_due(&pool, db.queue.name(), free, None).await;
+    let worker = builder().build().unwrap();
+    let health = worker.health();
+    let shutdown = CancellationToken::new();
+    let run = tokio::spawn(worker.run_until(shutdown.clone()));
+
+    let published = tokio::time::timeout(Duration::from_secs(5), async {
+        while cron_jobs_published(&pool, db.queue.name(), free).await == 0
+            || !health.snapshot().failures.iter().any(|failure| {
+                failure.component == WorkerComponent::Scheduler && failure.message.contains("remained locked")
+            })
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let cursor_while_held = schedule_cursor(&pool, db.queue.name(), locked).await;
+    let published_while_held = cron_jobs_published(&pool, db.queue.name(), locked).await;
+    holder.rollback().await.unwrap();
+    wait_until(Duration::from_secs(5), Duration::from_millis(20), "the released cron never resumed", || async {
+        cron_jobs_published(&pool, db.queue.name(), locked).await > 0
+            && !health.snapshot().failures.iter().any(|failure| failure.component == WorkerComponent::Scheduler)
+    })
+    .await;
+    stop_worker(shutdown, run).await;
+    assert!(published.is_ok(), "a held dedupe key prevented an unrelated cron from publishing");
+    assert_eq!(published_while_held, 0, "contention must not publish the locked cron");
+    assert_eq!(cursor_while_held, Some(held_cursor), "contention must preserve the occurrence for a later pass");
 }
 
 /// Reconciling a cron upserts its schedule row, and `ON CONFLICT DO UPDATE` locks the row it conflicts with even when

@@ -151,8 +151,9 @@ test("route parsing handles mounts, encoded names, details, and malformed escape
 
 test("stale suggestion responses cannot replace newer state", () => {
   const view = { suggestionRequest: 4, query: "  email " };
-  assert.equal(isSuggestionResponseCurrent(view, 4, "email"), true);
-  assert.equal(isSuggestionResponseCurrent(view, 3, "email"), false);
+  assert.equal(isSuggestionResponseCurrent(view, 4, "  email "), true);
+  assert.equal(isSuggestionResponseCurrent(view, 4, "email"), false);
+  assert.equal(isSuggestionResponseCurrent(view, 3, "  email "), false);
   assert.equal(isSuggestionResponseCurrent(view, 4, "sms"), false);
   assert.equal(isSuggestionResponseCurrent(view, 4), true);
 });
@@ -1452,6 +1453,62 @@ const clickElement = (page, element, selector) => page.handlers.get("click")({
 const jobBody = (id, fields = {}) => jsonResponse({ job: {
   id, queue: "main", name: "test", kind: "job", status: "failed", attempts: 1, max_attempts: 1, priority: 0, ...fields,
 } });
+
+test("Abort can cancel a sweeper recovery but stays disabled for an operator abort", async (t) => {
+  const id = "cccccccc-0000-7000-8000-000000000009";
+  let result = "pgqueue:swept";
+  const posts = [];
+  const page = await bootDashboard(t, {
+    tag: "abort-sweeper-recovery-test",
+    path: `/queues/main/jobs/${id}`,
+    fetch: async (url, options = {}) => {
+      if (options.method === "POST") {
+        posts.push(url);
+        result = null;
+        return jsonResponse({ aborted: true });
+      }
+      return jobBody(id, { status: "aborting", error: "swept", result, max_attempts: 3 });
+    },
+  });
+  assert.equal(page.element("action-abort").disabled, false);
+  await clickElement(page, page.element("action-abort"), "button[data-action]");
+  await clickElement(page, page.element("abort-confirm"), "button[data-confirm-abort]");
+  await settle();
+  assert.deepEqual(posts, [`/api/queues/main/jobs/${id}/abort`]);
+  assert.equal(page.element("action-abort").disabled, true, "a user abort must not be offered twice");
+});
+
+test("job name suggestions and exact filters preserve whitespace", async (t) => {
+  const requests = [];
+  const page = await bootDashboard(t, {
+    tag: "exact-whitespace-name-test",
+    path: "/queues/main",
+    fetch: async (url) => {
+      requests.push(url);
+      if (url.includes("/job-names?")) return jsonResponse({ names: [] });
+      if (url.includes("/workers?")) return jsonResponse({ workers: [] });
+      return jsonResponse({ jobs: [], next_cursor: null });
+    },
+  });
+  for (const name of [" email ", " "]) {
+    typeName(page, name);
+    await settle();
+    const suggestions = new URL(requests.findLast((url) => url.includes("/job-names?")), "http://localhost");
+    assert.equal(suggestions.searchParams.get("prefix"), name);
+    await page.handlers.get("submit")({
+      target: {
+        matches: (selector) => [".search-filter", ".job-name-search"].includes(selector),
+        dataset: { entryKind: "job" },
+      },
+      preventDefault() {},
+    });
+    await settle();
+    assert.equal(lastListing(requests).searchParams.get("name"), name);
+  }
+  typeName(page, "");
+  await settle();
+  assert.equal(lastListing(requests).searchParams.has("name"), false);
+});
 
 test("server strings reach the page as text, never as markup", async (t) => {
   const hostile = `<img src=x onerror=alert(1)>"'&`;

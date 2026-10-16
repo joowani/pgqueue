@@ -157,7 +157,7 @@ export const matchesNoJobName = (name) => name.includes("\0") || exceedsJobNameL
 
 export const isSuggestionResponseCurrent = (view, requestId, prefix) =>
   view.suggestionRequest === requestId &&
-  (prefix === undefined || view.query.trim() === prefix);
+  (prefix === undefined || view.query === prefix);
 
 /* pgqueue dashboard — no-build-step vanilla JS SPA.
  * Routes:  /            queues overview
@@ -808,7 +808,9 @@ const startDashboard = () => {
     // `retried_at` is what the retry statement refuses a second retry on, so a
     // retried row stays unretryable for good.
     const retryable = ["complete", "failed", "aborted"].includes(job.status) && !job.retried_at;
-    const abortable = ["queued", "running"].includes(job.status);
+    // A sweeper recovery remains abortable: an operator can still suppress its retry before recovery finishes.
+    const abortable = ["queued", "running"].includes(job.status) ||
+      (job.status === "aborting" && job.error === "swept" && job.result === "pgqueue:swept");
 
     return layout(
       [
@@ -1243,8 +1245,7 @@ const startDashboard = () => {
   };
 
   // `name` is committed exactly as given: the listing's filter is an exact match and a job name may carry edge
-  // whitespace, so trimming a picked suggestion filtered the listing to nothing. A typed query is trimmed by its
-  // caller.
+  // whitespace, so both typed queries and picked suggestions must preserve it.
   const chooseJobName = (view, key, name) => {
     dropSelection();
     cancelSuggestionFetch(view);
@@ -1391,7 +1392,7 @@ const startDashboard = () => {
   };
 
   const loadJobNameSuggestions = async (view, kind) => {
-    const prefix = view.query.trim();
+    const prefix = view.query;
     const requestId = view.suggestionRequest + 1;
     view.suggestionRequest = requestId;
     if (!prefix) {
@@ -1747,7 +1748,7 @@ const startDashboard = () => {
     // suggestionOptions. Escape and outside clicks remove the list entirely, so
     // there is nothing to read and the typed query stands.
     const selected = suggestionOptions()[view.suggestionIndex]?.dataset.jobName;
-    chooseJobName(view, key, selected ?? view.query.trim());
+    chooseJobName(view, key, selected ?? view.query);
   });
 
   app.addEventListener("keydown", (event) => {

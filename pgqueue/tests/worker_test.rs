@@ -4126,13 +4126,16 @@ async fn test_notification_listener_reconnect_backs_off_during_an_outage() {
 struct SilenceableRelay {
     address: std::net::SocketAddr,
     generation: tokio::sync::watch::Sender<u64>,
-    /// What the relay does with a new connection: [`RELAY`], [`REFUSE`] or [`STALL`] it.
+    accepted: Arc<AtomicUsize>,
+    /// Whether a new connection is relayed, refused, stalled immediately, or stalled when it subscribes.
     accepting: Arc<std::sync::atomic::AtomicU8>,
 }
 
 const RELAY: u8 = 0;
 const REFUSE: u8 = 1;
 const STALL: u8 = 2;
+const STALL_LISTEN: u8 = 3;
+const STALL_EVERY_LISTEN: u8 = 4;
 
 impl SilenceableRelay {
     async fn start(upstream: (String, u16)) -> Self {
@@ -4141,9 +4144,13 @@ impl SilenceableRelay {
         let (generation, silenced) = tokio::sync::watch::channel(0_u64);
         let accepting = Arc::new(std::sync::atomic::AtomicU8::new(RELAY));
         let accept = Arc::clone(&accepting);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let connections = Arc::clone(&accepted);
         tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
-                match accept.load(Ordering::SeqCst) {
+                connections.fetch_add(1, Ordering::SeqCst);
+                let mode = accept.load(Ordering::SeqCst);
+                match mode {
                     REFUSE => {
                         drop(client);
                         continue;
@@ -4155,6 +4162,8 @@ impl SilenceableRelay {
                         });
                         continue;
                     }
+                    // Only the next connection: the listener's replacement must be able to subscribe normally.
+                    STALL_LISTEN => accept.store(RELAY, Ordering::SeqCst),
                     _ => {}
                 }
                 let mut silenced = silenced.clone();
@@ -4168,7 +4177,28 @@ impl SilenceableRelay {
                     let (mut server_read, mut server_write) = server.into_split();
                     let relay = async {
                         tokio::join!(
-                            tokio::io::copy(&mut client_read, &mut server_write),
+                            async {
+                                if !matches!(mode, STALL_LISTEN | STALL_EVERY_LISTEN) {
+                                    return tokio::io::copy(&mut client_read, &mut server_write).await;
+                                }
+                                // Test connections disable TLS. Keep enough bytes across reads to recognize LISTEN,
+                                // then leave both sockets open without forwarding that subscription or answering it.
+                                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                let mut tail = Vec::new();
+                                let mut buffer = [0; 4096];
+                                loop {
+                                    let read = client_read.read(&mut buffer).await?;
+                                    if read == 0 {
+                                        return Ok(0);
+                                    }
+                                    tail.extend_from_slice(&buffer[..read]);
+                                    if tail.windows(7).any(|bytes| bytes == b"LISTEN ") {
+                                        std::future::pending::<()>().await;
+                                    }
+                                    tail.drain(..tail.len().saturating_sub(6));
+                                    server_write.write_all(&buffer[..read]).await?;
+                                }
+                            },
                             tokio::io::copy(&mut server_read, &mut client_write),
                         )
                     };
@@ -4182,7 +4212,7 @@ impl SilenceableRelay {
                 });
             }
         });
-        Self { address, generation, accepting }
+        Self { address, generation, accepting, accepted }
     }
 
     fn silence_open_connections(&self) {
@@ -4198,6 +4228,256 @@ impl SilenceableRelay {
     fn stall_new_connections(&self) {
         self.accepting.store(STALL, Ordering::SeqCst);
     }
+
+    fn stall_next_subscription(&self) {
+        self.accepting.store(STALL_LISTEN, Ordering::SeqCst);
+    }
+}
+
+async fn assert_recovery_replaces_a_silent_connection(pool: PgPool, refund: bool) {
+    let control = TestDb::new(pool.clone()).await;
+    let options = pool.connect_options();
+    let relay = SilenceableRelay::start((options.get_host().to_string(), options.get_port())).await;
+    let relayed_options = options.as_ref().clone().host("127.0.0.1").port(relay.address.port());
+    let relayed = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(relayed_options).await.unwrap();
+    let queue = Queue::builder("postgres://unused").pool(relayed).connect().await.unwrap();
+    let worker_id = Uuid::now_v7();
+    let consumer = queue.consumer(worker_id);
+    consumer.heartbeat(json!({}), None, Duration::from_secs(60)).await.unwrap();
+    let id = queue
+        .enqueue_raw(crate::with_config("silent-recovery", |config| config.max_attempts = 2))
+        .await
+        .unwrap()
+        .job_id();
+    let (claimed, attempt) = if refund {
+        (queue.dequeue(1, worker_id).await.unwrap().remove(0), None)
+    } else {
+        let attempt = consumer.dequeue(1).await.unwrap().remove(0);
+        (attempt.job().clone(), Some(attempt))
+    };
+    let pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()").fetch_one(queue.pool()).await.unwrap();
+    let mut holding = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM pgqueue.jobs WHERE id = $1 FOR UPDATE").bind(id).execute(&mut *holding).await.unwrap();
+    if refund {
+        pgqueue::__test_support::drop_armed_dequeue_claim_guard(
+            &queue,
+            worker_id,
+            &[(claimed.id, claimed.attempts, claimed.started_at)],
+        );
+    } else {
+        drop(attempt);
+    }
+    wait_for_lock_waiter(&control, "%WITH requeued AS (%", "recovery never reached the held job").await;
+    // Stall after BEGIN has succeeded, so SQLx would ordinarily return the connection through its rollback/ping
+    // cleanup. Kill the backend after silencing the relay: its locks disappear, but the client cannot hear its exit.
+    relay.silence_open_connections();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    sqlx::query("SELECT pg_terminate_backend($1)").bind(pid).execute(&pool).await.unwrap();
+    holding.rollback().await.unwrap();
+    wait_until(Duration::from_secs(20), Duration::from_millis(20), "recovery stayed on the silent connection", || {
+        let control = &control;
+        async move { control.queue.fetch_job(id).await.unwrap().is_some_and(|row| row.status == JobStatus::Queued) }
+    })
+    .await;
+    let recovered = control.queue.fetch_job(id).await.unwrap().unwrap();
+    assert_eq!(recovered.attempts, 1);
+    assert_eq!(recovered.max_attempts, if refund { 3 } else { 2 });
+    assert_eq!(recovered.refunds, i32::from(refund));
+    assert_eq!(recovered.worker_id, None);
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT expires_at > clock_timestamp() FROM pgqueue.workers WHERE id = $1")
+            .bind(worker_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "recovery must finish while the worker's lease is still live"
+    );
+    assert_eq!(relay.accepted.load(Ordering::SeqCst), 2, "the one-slot pool must replace its silent connection");
+    tokio::time::timeout(Duration::from_secs(2), queue.pool().close()).await.unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_dropped_attempt_recovery_replaces_a_silent_connection(pool: PgPool) {
+    assert_recovery_replaces_a_silent_connection(pool, false).await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_unacknowledged_claim_recovery_replaces_a_silent_connection(pool: PgPool) {
+    assert_recovery_replaces_a_silent_connection(pool, true).await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_dropped_attempt_recovery_releases_the_pool_while_a_job_is_locked(pool: PgPool) {
+    let control = TestDb::new(pool.clone()).await;
+    let queue = TestDb::new(pool_with_max(&pool, 1).await).await.queue;
+    queue.enqueue_raw(crate::with_config("locked-recovery", |config| config.max_attempts = 2)).await.unwrap();
+    let consumer = leased_consumer(&queue, Uuid::now_v7()).await;
+    let attempt = consumer.dequeue(1).await.unwrap().remove(0);
+    let id = attempt.job().id;
+    let mut holding = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM pgqueue.jobs WHERE id = $1 FOR UPDATE").bind(id).execute(&mut *holding).await.unwrap();
+    drop(attempt);
+    wait_for_lock_waiter(&control, "%WITH requeued AS (%", "recovery never reached the held job").await;
+    let acquired = tokio::time::timeout(Duration::from_secs(2), queue.pool().acquire()).await;
+    holding.rollback().await.unwrap();
+    let connection = acquired.expect("a recovery lock wait monopolized the shared pool").unwrap();
+    drop(connection);
+    wait_until(Duration::from_secs(10), Duration::from_millis(20), "recovery did not retry the released job", || {
+        let control = &control;
+        async move { control.queue.fetch_job(id).await.unwrap().is_some_and(|row| row.status == JobStatus::Queued) }
+    })
+    .await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_deferred_claim_recovery_does_not_wait_for_a_release_ping(pool: PgPool) {
+    let control = TestDb::new(pool.clone()).await;
+    let options = pool.connect_options();
+    let relay = SilenceableRelay::start((options.get_host().to_string(), options.get_port())).await;
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release_armed = Arc::clone(&armed);
+    let generation = relay.generation.clone();
+    let relayed = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_release(move |_, _| {
+            let armed = Arc::clone(&release_armed);
+            let generation = generation.clone();
+            Box::pin(async move {
+                if armed.swap(false, Ordering::SeqCst) {
+                    generation.send_modify(|value| *value += 1);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Ok(true)
+            })
+        })
+        .connect_with(options.as_ref().clone().host("127.0.0.1").port(relay.address.port()))
+        .await
+        .unwrap();
+    let queue = Queue::builder("postgres://unused").pool(relayed).connect().await.unwrap();
+    let worker_id = Uuid::now_v7();
+    let consumer = leased_consumer(&queue, worker_id).await;
+    queue.enqueue_raw(crate::with_config("deferred-recovery", |config| config.max_attempts = 2)).await.unwrap();
+    let claimed = queue.dequeue(1, worker_id).await.unwrap().remove(0);
+    let key = pgqueue::__test_support::claim_resolution_lock_key(&control.database);
+    let mut holding = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock_shared($1, hashtext($2))")
+        .bind(key)
+        .bind(worker_id.to_string())
+        .execute(&mut *holding)
+        .await
+        .unwrap();
+    pgqueue::__test_support::drop_armed_dequeue_claim_guard(
+        &queue,
+        worker_id,
+        &[(claimed.id, claimed.attempts, claimed.started_at)],
+    );
+    wait_for_advisory_waiter(&pool, key, "recovery never waited on the in-flight claim").await;
+    // If a deferred pass returns its connection, silence it in the release hook before SQLx's unbounded ping.
+    // Closing the deferred connection skips that hook and leaves capacity for the next recovery pass.
+    armed.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    armed.store(false, Ordering::SeqCst);
+    holding.rollback().await.unwrap();
+    wait_until(Duration::from_secs(10), Duration::from_millis(20), "deferred recovery lost its pool slot", || {
+        let control = &control;
+        async move {
+            control.queue.fetch_job(claimed.id).await.unwrap().is_some_and(|row| row.status == JobStatus::Queued)
+        }
+    })
+    .await;
+    assert!(relay.accepted.load(Ordering::SeqCst) > 1, "a deferred pass must retire its connection");
+    drop(consumer);
+    queue.pool().close().await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_repeated_listener_subscription_stalls_bound_open_connections(pool: PgPool) {
+    let options = pool.connect_options();
+    let relay = SilenceableRelay::start((options.get_host().to_string(), options.get_port())).await;
+    let relayed_options = options
+        .as_ref()
+        .clone()
+        .host("127.0.0.1")
+        .port(relay.address.port())
+        .ssl_mode(sqlx::postgres::PgSslMode::Disable);
+    let relayed = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(relayed_options).await.unwrap();
+    let queue = Queue::builder("postgres://unused").pool(relayed).connect().await.unwrap();
+    assert!(pgqueue::__test_support::set_listener_probe(
+        &queue,
+        Duration::from_millis(200),
+        Duration::from_millis(500)
+    ));
+    let baseline = relay.accepted.load(Ordering::SeqCst);
+    relay.accepting.store(STALL_EVERY_LISTEN, Ordering::SeqCst);
+    let mut health = pgqueue::__test_support::listener_health(&queue);
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(10), health.changed()).await.unwrap().unwrap();
+        assert!(health.borrow_and_update().is_some());
+    }
+    // Both cleanup operations are now stuck. Further retries must wait for capacity, rather than opening new pools.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let opened = relay.accepted.load(Ordering::SeqCst) - baseline;
+    queue.counts().await.unwrap();
+    drop(queue);
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname = current_database() AND pid <> pg_backend_pid()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(opened, 2, "repeated subscription timeouts leaked additional listener connections");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn test_notification_listener_replaces_a_session_stalled_during_subscription(pool: PgPool) {
+    let options = pool.connect_options();
+    let relay = SilenceableRelay::start((options.get_host().to_string(), options.get_port())).await;
+    let relayed_options = options
+        .as_ref()
+        .clone()
+        .host("127.0.0.1")
+        .port(relay.address.port())
+        .ssl_mode(sqlx::postgres::PgSslMode::Disable);
+    let relayed = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(relayed_options).await.unwrap();
+    let queue = Queue::builder("postgres://unused").pool(relayed).connect().await.unwrap();
+    assert!(pgqueue::__test_support::set_listener_probe(
+        &queue,
+        Duration::from_millis(200),
+        Duration::from_millis(500)
+    ));
+    relay.stall_next_subscription();
+    let mut health = pgqueue::__test_support::listener_health(&queue);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while health.borrow_and_update().is_none() {
+            health.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("a stalled LISTEN never reported a subscription failure");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while health.borrow_and_update().is_some() {
+            health.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the listener never replaced the stalled subscription");
+    let mut wakeups = pgqueue::__test_support::listener_wakeups(&queue);
+    sqlx::query("SELECT pg_notify($1, 'enqueue')")
+        .bind(pgqueue::__test_support::notify_channel(queue.name()))
+        .execute(&pool)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), wakeups.recv()).await.unwrap().unwrap();
+
+    drop(queue);
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname = current_database() AND pid <> pg_backend_pid()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
 }
 
 /// A `LISTEN` session that stops answering — dropped for idleness by a NAT or load balancer, with neither end told —
