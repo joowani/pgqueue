@@ -1501,7 +1501,7 @@ async fn test_pending_abort_wins_over_a_final_attempt_failure(pool: PgPool) {
     let worker = test_worker(db.queue.clone())
         .register_job(fails_during_abort)
         .state(state.clone())
-        .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
+        .timers(WorkerTimers { abort: Duration::from_secs(3_600), ..test_timers() })
         .build()
         .unwrap();
     let token = CancellationToken::new();
@@ -1533,7 +1533,7 @@ async fn test_pending_abort_wins_over_a_successful_handler(pool: PgPool) {
     let worker = test_worker(db.queue.clone())
         .register_job(succeeds_during_abort)
         .state(state.clone())
-        .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
+        .timers(WorkerTimers { abort: Duration::from_secs(3_600), ..test_timers() })
         .build()
         .unwrap();
     let token = CancellationToken::new();
@@ -1767,7 +1767,7 @@ async fn test_sweeper_abort_racing_a_retryable_failure_still_retries(pool: PgPoo
     let worker = test_worker(db.queue.clone())
         .register_job(fails_as_sweeper_marks)
         .state(state.clone())
-        .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
+        .timers(WorkerTimers { abort: Duration::from_secs(3_600), ..test_timers() })
         .build()
         .unwrap();
     let worker_id = worker.id();
@@ -1807,7 +1807,7 @@ async fn test_user_abort_during_the_sweeper_marked_window_wins_over_the_retry(po
     let worker = test_worker(db.queue.clone())
         .register_job(fails_as_sweeper_marks)
         .state(state.clone())
-        .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
+        .timers(WorkerTimers { abort: Duration::from_secs(3_600), ..test_timers() })
         .build()
         .unwrap();
     let worker_id = worker.id();
@@ -1854,10 +1854,12 @@ async fn test_sweeper_abort_racing_a_retryable_failure_keeps_the_handler_error(p
         retried: Arc::new(tokio::sync::Notify::new()),
         hold: Arc::new(tokio::sync::Notify::new()),
     };
+    // No abort poll during the test: one landing between the sweep and the handler's failure gave the handler only
+    // the 100ms abort grace, and a busy machine cancelled it first, leaving no failure to report.
     let worker = test_worker(db.queue.clone())
         .register_job(fails_then_parks_as_sweeper_marks)
         .state(state.clone())
-        .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
+        .timers(WorkerTimers { abort: Duration::from_secs(3_600), ..test_timers() })
         .build()
         .unwrap();
     let worker_id = worker.id();
@@ -1906,7 +1908,7 @@ async fn test_successful_handler_finishes_through_a_sweeper_abort(pool: PgPool) 
     let worker = test_worker(db.queue.clone())
         .register_job(succeeds_as_sweeper_marks)
         .state(state.clone())
-        .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
+        .timers(WorkerTimers { abort: Duration::from_secs(3_600), ..test_timers() })
         .build()
         .unwrap();
     let worker_id = worker.id();
@@ -1942,7 +1944,7 @@ async fn test_final_handler_failure_finishes_through_a_sweeper_abort(pool: PgPoo
     let worker = test_worker(db.queue.clone())
         .register_job(fails_as_sweeper_marks)
         .state(state.clone())
-        .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
+        .timers(WorkerTimers { abort: Duration::from_secs(3_600), ..test_timers() })
         .build()
         .unwrap();
     let worker_id = worker.id();
@@ -3795,7 +3797,10 @@ async fn listenerless(_: ()) -> anyhow::Result<()> {
 async fn test_worker_processes_jobs_by_polling_when_the_listener_cannot_connect() {
     crate::init_tracing();
     let url = crate::fresh_database("listenerless").await;
-    Queue::connect(&url).await.unwrap();
+    // The test observes the job as the database owner, who may still connect. The worker detaches one of the four
+    // pooled connections to hold sweep leadership, and the role may not replace it, so a status read through the
+    // worker's queue failed whenever the worker had the other three busy.
+    let observer = Queue::connect(&url).await.unwrap();
     // Warm a full pool, then revoke the role's right to open *new* connections.
     // Established connections keep working, so the queue stays usable while the
     // listener — which needs its own connection outside the pool — cannot start.
@@ -3821,7 +3826,7 @@ async fn test_worker_processes_jobs_by_polling_when_the_listener_cannot_connect(
         Duration::from_secs(60),
         Duration::from_millis(50),
         "job was never processed by the polling fallback",
-        || async { queue.fetch_job(id).await.unwrap().is_some_and(|row| row.status == JobStatus::Complete) },
+        || async { observer.fetch_job(id).await.unwrap().is_some_and(|row| row.status == JobStatus::Complete) },
     )
     .await;
     // Losing notifications is a real degradation, so it is reported as one.
@@ -4238,7 +4243,10 @@ async fn assert_recovery_replaces_a_silent_connection(pool: PgPool, refund: bool
     let control = TestDb::new(pool.clone()).await;
     let options = pool.connect_options();
     let relay = SilenceableRelay::start((options.get_host().to_string(), options.get_port())).await;
-    let relayed_options = options.as_ref().clone().host("127.0.0.1").port(relay.address.port());
+    // Named, so the test can end whichever relayed session recovery is on. A pass that hits its row-lock bound before
+    // the relay is silenced closes its connection, and the next pass opens another.
+    let relayed_options =
+        options.as_ref().clone().host("127.0.0.1").port(relay.address.port()).application_name("silent-recovery");
     let relayed = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(relayed_options).await.unwrap();
     let queue = Queue::builder("postgres://unused").pool(relayed).connect().await.unwrap();
     let worker_id = Uuid::now_v7();
@@ -4255,7 +4263,6 @@ async fn assert_recovery_replaces_a_silent_connection(pool: PgPool, refund: bool
         let attempt = consumer.dequeue(1).await.unwrap().remove(0);
         (attempt.job().clone(), Some(attempt))
     };
-    let pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()").fetch_one(queue.pool()).await.unwrap();
     let mut holding = pool.begin().await.unwrap();
     sqlx::query("SELECT 1 FROM pgqueue.jobs WHERE id = $1 FOR UPDATE").bind(id).execute(&mut *holding).await.unwrap();
     if refund {
@@ -4270,9 +4277,17 @@ async fn assert_recovery_replaces_a_silent_connection(pool: PgPool, refund: bool
     wait_for_lock_waiter(&control, "%WITH requeued AS (%", "recovery never reached the held job").await;
     // Stall after BEGIN has succeeded, so SQLx would ordinarily return the connection through its rollback/ping
     // cleanup. Kill the backend after silencing the relay: its locks disappear, but the client cannot hear its exit.
+    // Killing only the session that existed before recovery started left a replacement holding the claim lock until the
+    // server's 30s idle-in-transaction timeout.
     relay.silence_open_connections();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    sqlx::query("SELECT pg_terminate_backend($1)").bind(pid).execute(&pool).await.unwrap();
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname = current_database() AND application_name = 'silent-recovery'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     holding.rollback().await.unwrap();
     wait_until(Duration::from_secs(20), Duration::from_millis(20), "recovery stayed on the silent connection", || {
         let control = &control;
@@ -4292,7 +4307,7 @@ async fn assert_recovery_replaces_a_silent_connection(pool: PgPool, refund: bool
             .unwrap(),
         "recovery must finish while the worker's lease is still live"
     );
-    assert_eq!(relay.accepted.load(Ordering::SeqCst), 2, "the one-slot pool must replace its silent connection");
+    assert!(relay.accepted.load(Ordering::SeqCst) >= 2, "the one-slot pool must replace its silent connection");
     tokio::time::timeout(Duration::from_secs(2), queue.pool().close()).await.unwrap();
 }
 
@@ -6784,7 +6799,7 @@ async fn test_a_sweeper_abort_a_refused_retry_finds_is_not_counted_on_the_worker
         // One slot, so the follow-up below runs only once the swept attempt's `process`, counters included, is done.
         .concurrency(1)
         // Rare enough that the abort poll does not see the operator's abort before recovery settles it.
-        .timers(WorkerTimers { abort: Duration::from_secs(5), ..test_timers() })
+        .timers(WorkerTimers { abort: Duration::from_secs(3_600), ..test_timers() })
         .build()
         .unwrap();
     let worker_id = worker.id();
@@ -6904,6 +6919,12 @@ async fn test_a_burst_processor_does_not_drain_under_a_fetch_that_counted_it(poo
         .unwrap();
 }
 
+/// The deadline of a heartbeat a test expects to land. Opening the lease's own connection gets half of it, and under
+/// `cargo llvm-cov` with the parallel suite that takes longer than the 250ms a 500ms deadline left, after which the
+/// heartbeat fell back to a pool the test had saturated or silenced. A heartbeat stuck on a dead connection still
+/// misses this deadline, and one waiting behind the pool outlasts the 10s around it, so the tests tell them apart.
+const LANDING_DEADLINE: Duration = Duration::from_secs(4);
+
 async fn lease_of(queue: &Queue, worker_id: Uuid) -> pgqueue::WorkerInfo {
     list_workers(queue).await.into_iter().find(|worker| worker.id == worker_id).expect("the worker's lease")
 }
@@ -6929,7 +6950,7 @@ async fn test_a_heartbeat_is_not_queued_behind_a_saturated_pool(pool: PgPool) {
             &db.queue,
             worker_id,
             Duration::from_secs(30),
-            Duration::from_millis(500),
+            LANDING_DEADLINE,
         ),
     )
     .await
@@ -6954,16 +6975,16 @@ async fn test_a_heartbeat_queued_for_a_connection_is_not_abandoned(pool: PgPool)
     let worker_id = Uuid::now_v7();
     let ttl = Duration::from_secs(30);
     let mut lease = pgqueue::__test_support::WorkerLease::new(&queue, worker_id);
-    tokio::time::timeout(Duration::from_secs(10), lease.renew(ttl, Duration::from_millis(500)))
+    tokio::time::timeout(Duration::from_secs(10), lease.renew(ttl, LANDING_DEADLINE))
         .await
         .expect("the heartbeat never returned")
         .expect("a heartbeat refused a connection of its own renews on the pool's idle one");
     let before = lease_expiry(&pool, worker_id).await;
 
     let held = queue.pool().acquire().await.unwrap();
-    let heartbeat = tokio::spawn(async move { lease.renew(ttl, Duration::from_millis(500)).await });
-    // Queued behind the pool's only connection for four of its deadlines.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let heartbeat = tokio::spawn(async move { lease.renew(ttl, LANDING_DEADLINE).await });
+    // Queued behind the pool's only connection for longer than its deadline.
+    tokio::time::sleep(LANDING_DEADLINE + Duration::from_secs(1)).await;
     drop(held);
     tokio::time::timeout(Duration::from_secs(10), heartbeat)
         .await
@@ -6982,7 +7003,7 @@ async fn test_a_heartbeat_whose_own_connection_is_never_served_renews_through_th
     relay.stall_new_connections();
     let worker_id = Uuid::now_v7();
     let mut lease = pgqueue::__test_support::WorkerLease::new(&queue, worker_id);
-    tokio::time::timeout(Duration::from_secs(10), lease.renew(Duration::from_secs(30), Duration::from_secs(2)))
+    tokio::time::timeout(Duration::from_secs(10), lease.renew(Duration::from_secs(30), LANDING_DEADLINE))
         .await
         .expect("the heartbeat never returned")
         .expect("a heartbeat whose own connection is never served renews through the pool");
@@ -7105,7 +7126,7 @@ async fn test_a_heartbeat_is_not_held_by_pooled_connections_that_went_dead_while
             &queue,
             worker_id,
             Duration::from_secs(30),
-            Duration::from_millis(500),
+            LANDING_DEADLINE,
         ),
     )
     .await
@@ -7128,7 +7149,7 @@ async fn test_a_heartbeat_replaces_its_own_connection_once_it_stops_answering(po
     let worker_id = Uuid::now_v7();
     let ttl = Duration::from_secs(30);
     let mut lease = pgqueue::__test_support::WorkerLease::new(&queue, worker_id);
-    lease.renew(ttl, Duration::from_millis(500)).await.expect("the first heartbeat opens the lease's own connection");
+    lease.renew(ttl, LANDING_DEADLINE).await.expect("the first heartbeat opens the lease's own connection");
     let before = lease_expiry(&pool, worker_id).await;
 
     relay.silence_open_connections();
@@ -7137,7 +7158,7 @@ async fn test_a_heartbeat_replaces_its_own_connection_once_it_stops_answering(po
         .expect("a heartbeat on a connection that stopped answering must be abandoned at its deadline")
         .expect_err("the silenced connection cannot answer");
     assert!(matches!(error, Error::WorkerTask("worker lease heartbeat exceeded its deadline")), "{error}");
-    tokio::time::timeout(Duration::from_secs(10), lease.renew(ttl, Duration::from_millis(500)))
+    tokio::time::timeout(Duration::from_secs(10), lease.renew(ttl, LANDING_DEADLINE))
         .await
         .expect("the heartbeat after an abandoned one never returned")
         .expect("the heartbeat after an abandoned one must land on a fresh connection");
@@ -7147,7 +7168,7 @@ async fn test_a_heartbeat_replaces_its_own_connection_once_it_stops_answering(po
     relay.silence_open_connections();
     let dropped = tokio::time::timeout(Duration::from_millis(200), lease.renew(ttl, Duration::from_secs(5))).await;
     assert!(dropped.is_err(), "a write on a silenced connection cannot finish");
-    tokio::time::timeout(Duration::from_secs(10), lease.renew(ttl, Duration::from_millis(500)))
+    tokio::time::timeout(Duration::from_secs(10), lease.renew(ttl, LANDING_DEADLINE))
         .await
         .expect("the heartbeat after a dropped one never returned")
         .expect("the heartbeat after a dropped one must land on a fresh connection");

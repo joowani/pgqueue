@@ -846,14 +846,17 @@ mod enqueue_and_wait {
         let waiter = {
             let handle = handle.clone();
             let subscriber = tracing_subscriber::registry::Registry::default().with(failed_refetch.clone());
-            tokio::spawn(async move { handle.wait(Some(Duration::from_secs(10))).await }.with_subscriber(subscriber))
+            tokio::spawn(async move { handle.wait(Some(Duration::from_secs(20))).await }.with_subscriber(subscriber))
         };
         wait_for_done_listener(&db).await;
-        stats.wait_for_calls(&fetches, 1, "waiter never read the live job").await;
+        // Four reads: the first, then fallback polls after 250ms, 500ms and 1s, so the next poll is two seconds away.
+        // A poll that comes due while the pool is held fails and backs off without reading the event, so the event's
+        // re-fetch never runs; after only the first read, the next poll was 250ms away, which a busy machine missed.
+        stats.wait_for_calls(&fetches, 4, "waiter never settled into its slowest poll").await;
 
-        // Occupy the waiter's entire query pool only after its first successful
-        // read. The independent LISTEN connection still receives the finish,
-        // but the event-triggered re-fetch reaches its acquire timeout.
+        // Occupy the waiter's entire query pool only after its successful reads.
+        // The independent LISTEN connection still receives the finish, but the
+        // event-triggered re-fetch reaches its acquire timeout.
         let held = query_pool.acquire().await.unwrap();
         let active = control.queue.dequeue(1, uuid::Uuid::now_v7()).await.unwrap().remove(0);
         assert!(control.queue.finish(&active, JobStatus::Failed, None, Some("odd number 3")).await.unwrap());
