@@ -4789,7 +4789,7 @@ fn test_readme_dashboard_example_configures_its_proxy() {
     for required in [
         ".trusted_proxy_hops(1)",
         "$proxy_add_x_forwarded_for",
-        "proxy_set_header Host $host;",
+        "proxy_set_header Host $http_host;",
     ] {
         assert!(section.contains(required), "the README's dashboard example must show {required:?}");
     }

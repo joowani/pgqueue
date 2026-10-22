@@ -315,9 +315,12 @@ impl Sweeper {
             // session-scoped lock; the process re-contends on a later pass once
             // it can acquire from its pool again, and until then a healthy peer
             // is free to take over.
+            // A closed pool never reopens, so its failures are not counted toward the bound but end leadership at
+            // once: the dedicated connection is detached from the pool and still answers its probe, so it held the
+            // lock, with no sweeping anywhere, for the passes the bound took.
             Err(_) if self.is_leader() => {
                 self.failed_passes += 1;
-                if self.failed_passes >= MAX_LEADER_SWEEP_FAILURES {
+                if self.failed_passes >= MAX_LEADER_SWEEP_FAILURES || self.database.pool().is_closed() {
                     tracing::warn!(
                         queue = %self.database.name(), failures = self.failed_passes,
                         "released sweep leadership after consecutive failed passes"

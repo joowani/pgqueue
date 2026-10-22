@@ -271,8 +271,8 @@ fn expand(mode: Mode, attrs: JobAttrs, item: TokenStream) -> syn::Result<TokenSt
             let revision = attrs.revision.unwrap_or(0);
             (
                 quote! {
-                    /// Builds an enqueue request for a one-off, out-of-schedule
-                    /// run of this cron job (pass it to `Queue::enqueue`).
+                    /// Builds an enqueue request for a one-off, out-of-schedule run of this cron job (pass it to
+                    /// `Queue::enqueue`). It has no dedupe key, so it can run beside a live scheduled occurrence.
                     #vis fn job() -> #runtime::JobBuilder<#ident> {
                         #runtime::JobBuilder::new(())
                     }
@@ -280,8 +280,8 @@ fn expand(mode: Mode, attrs: JobAttrs, item: TokenStream) -> syn::Result<TokenSt
                 quote!(#ident(#(#extractor_names),*)),
                 quote! {
                     impl #runtime::CronDefinition for #ident {
-                        const SCHEDULE: &'static str = #schedule;
-                        const CRON_REVISION: u64 = #revision;
+                        const SCHEDULE: &'static ::core::primitive::str = #schedule;
+                        const CRON_REVISION: ::core::primitive::u64 = #revision;
                     }
                 },
             )
@@ -438,7 +438,7 @@ fn expand(mode: Mode, attrs: JobAttrs, item: TokenStream) -> syn::Result<TokenSt
             impl #runtime::JobType for #ident {
                 #args_assoc
                 #output_assoc
-                const NAME: &'static str = #name;
+                const NAME: &'static ::core::primitive::str = #name;
 
                 fn config() -> #runtime::JobConfig {
                     let #config_mut __config =
@@ -1271,7 +1271,7 @@ mod tests {
             flat.contains("typeOutput=<anyhow::Result<()>as::pgqueue::__private::IntoJobResult>::Output;"),
             "{out}"
         );
-        assert!(flat.contains("constNAME:&'staticstr=\"send_email\";"), "{out}");
+        assert!(flat.contains("constNAME:&'static::core::primitive::str=\"send_email\";"), "{out}");
         assert!(flat.contains("fnjob(__args:SendEmail)"), "{out}");
         assert!(flat.contains("asyncfncall(__arg0:SendEmail)->anyhow::Result<()>"), "{out}");
         // The hidden handler keeps the name the user wrote (see
@@ -1317,7 +1317,7 @@ mod tests {
             },
         );
         let flat = compact(&out);
-        assert!(flat.contains("constNAME:&'staticstr=\"custom\";"), "{out}");
+        assert!(flat.contains("constNAME:&'static::core::primitive::str=\"custom\";"), "{out}");
         assert!(flat.contains("__config.max_attempts=4u32;"), "{out}");
         assert!(
             flat.contains(
@@ -1914,7 +1914,7 @@ mod tests {
                 async fn r#type(_: ()) {}
             },
         );
-        assert!(compact(&out).contains("constNAME:&'staticstr=\"type\";"), "{out}");
+        assert!(compact(&out).contains("constNAME:&'static::core::primitive::str=\"type\";"), "{out}");
     }
 
     /// The struct's name is resolved at the call site, whose context carries
@@ -1934,7 +1934,7 @@ mod tests {
         ] {
             let flat = compact(&out);
             assert!(flat.contains("structr#gen;"), "{out}");
-            assert!(flat.contains("constNAME:&'staticstr=\"gen\";"), "{out}");
+            assert!(flat.contains("constNAME:&'static::core::primitive::str=\"gen\";"), "{out}");
         }
         // A name the user already wrote raw is not escaped twice.
         let out = expand_ok(
@@ -2339,7 +2339,7 @@ mod tests {
         assert!(flat.contains("::pgqueue::JobBuilder::new(())"), "{out}");
         // The schedule is baked in.
         assert!(flat.contains("impl::pgqueue::CronDefinitionforcleanup"), "{out}");
-        assert!(flat.contains("constSCHEDULE:&'staticstr=\"*/5****\";"), "{out}");
+        assert!(flat.contains("constSCHEDULE:&'static::core::primitive::str=\"*/5****\";"), "{out}");
         // Every parameter is an extractor; no payload decode.
         assert!(flat.contains("<JobContextas::pgqueue::FromJobContext>::from_context(&__ctx)"), "{out}");
         assert!(flat.contains("<JobState<Pool>as::pgqueue::FromJobContext>::from_context(&__ctx)"), "{out}");
@@ -2358,9 +2358,9 @@ mod tests {
             },
         );
         let flat = compact(&out);
-        assert!(flat.contains("constNAME:&'staticstr=\"tidy\";"), "{out}");
+        assert!(flat.contains("constNAME:&'static::core::primitive::str=\"tidy\";"), "{out}");
         assert!(flat.contains("__config.max_attempts=2u32;"), "{out}");
-        assert!(flat.contains("constSCHEDULE:&'staticstr=\"*/5****\";"), "{out}");
+        assert!(flat.contains("constSCHEDULE:&'static::core::primitive::str=\"*/5****\";"), "{out}");
         // The handler's value is bound before it is encoded, so the encode's
         // `IntoJobResult` obligation can carry the return type's span.
         assert!(flat.contains("let__result:()=cleanup().await;"), "{out}");

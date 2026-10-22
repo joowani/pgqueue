@@ -16,7 +16,11 @@
 //! at all replaces cargo's default "rerun on any change in the package", so leaving it untracked
 //! left a warm tree validating the *old* history table against a database the migrator had just
 //! written the new one to, which surfaces as "database is missing pgqueue migrations".
+//!
+//! The dashboard's assets are the same input a third time: `include_dir!`, without its nightly-only tracking, expands
+//! to one `include_bytes!` per file, so an added or removed asset left a warm tree serving the old set.
 fn main() {
     println!("cargo:rerun-if-changed=migrations");
     println!("cargo:rerun-if-changed=sqlx.toml");
+    println!("cargo:rerun-if-changed=dashboard");
 }

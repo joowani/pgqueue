@@ -742,7 +742,8 @@ impl Dashboard {
     /// attacker's domain.
     ///
     /// List every other name clients use to reach the dashboard, such as a reverse proxy's public name, without a
-    /// scheme or port. A reverse proxy must forward the client's `Host` header (nginx: `proxy_set_header Host $host;`).
+    /// scheme or port. A reverse proxy must forward the client's `Host` header, port included, which the login
+    /// compares with the browser's `Origin` (nginx: `proxy_set_header Host $http_host;`).
     /// [`Dashboard::router`] returns [`Error::Config`] for an entry that is not a host name.
     ///
     /// ```no_run
@@ -783,7 +784,7 @@ impl Dashboard {
     /// [`Dashboard::trusted_proxy_hops`] assumes. The standalone server rejects requests carrying `Transfer-Encoding` —
     /// which covers every request that also carries `Content-Length`, in either order — and closes their connections.
     /// Configure the proxy to reject or normalise the same pair so ambiguous framing never crosses either HTTP hop.
-    /// Have it forward the client's `Host` header too, and list the name clients use with
+    /// Have it forward the client's `Host` header too, port included, and list the name clients use with
     /// [`Dashboard::allowed_hosts`].
     ///
     /// ```no_run
@@ -822,8 +823,8 @@ impl Dashboard {
     /// [`Dashboard::allowed_hosts`].
     ///
     /// The router sets no request deadline of its own (see [`DashboardServer::request_timeout`]), so the Retry and
-    /// Abort actions wait at most 30 seconds for a lock another transaction holds on their job, then answer
-    /// `503 Service Unavailable` with the job unchanged.
+    /// Abort actions wait at most 30 seconds for each lock another transaction holds on their job, then answer
+    /// `503 Service Unavailable` with the job unchanged. A Retry can wait for two: its job's row, then its dedupe key.
     ///
     /// ```no_run
     /// # fn build(queue: pgqueue::Queue) -> Result<axum::Router, pgqueue::Error> {
@@ -1006,7 +1007,10 @@ impl DashboardServer {
     ///
     /// The Retry and Abort actions stop waiting for a lock another transaction holds on their job a little before the
     /// deadline — a tenth of the timeout, and a second at most — and answer `503 Service Unavailable` with the job
-    /// unchanged.
+    /// unchanged. That bound applies to each lock wait, and a Retry can wait twice, for its job's row and then for its
+    /// dedupe key, so one held up by both can reach the deadline and answer `504 Gateway Timeout` instead. Its
+    /// transaction is then rolled back, so that Retry leaves the job unchanged too, unless the deadline fell while its
+    /// commit was in flight.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.limits.request_timeout = timeout;
         self
@@ -1314,6 +1318,26 @@ async fn accept_any(listeners: &mut [tokio::net::TcpListener]) -> (tokio::net::T
     .await
 }
 
+/// Dropped without [`DashboardRuntime::finish_shutdown`] — a panic unwinding through the worker or server that owns
+/// it — the server task went on serving, detached, on a port that an in-process restart then failed to bind. Told to
+/// stop instead, it drains its connections on its own, and is aborted past the same [`SHUTDOWN_TIMEOUT`] that
+/// `finish_shutdown` gives it, so a client reading slowly cannot keep it alive. After an ordinary shutdown, which has
+/// already taken the task, this changes nothing.
+impl Drop for DashboardRuntime {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        if let Some(task) = &self.task
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let task = task.abort_handle();
+            runtime.spawn(async move {
+                tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
+                task.abort();
+            });
+        }
+    }
+}
+
 impl DashboardRuntime {
     pub(crate) fn start(bound: DashboardBoundServer) -> Self {
         let shutdown = CancellationToken::new();
@@ -1409,6 +1433,9 @@ async fn serve_dashboard(bound: DashboardBoundServer, shutdown: CancellationToke
         }
     }
 
+    // Closed before the drain, so a client arriving while open connections finish is refused at once rather than
+    // queued in the backlog of a socket nothing accepts on any more, and then reset.
+    drop(listeners);
     while let Some(result) = tasks.join_next().await {
         report_dashboard_connection_task(result);
     }
@@ -1540,6 +1567,16 @@ mod dashboard_server_tests {
         let allowed_hosts = allowed_host_names(&server.dashboard.allowed_hosts).unwrap();
         assert!(is_allowed_host("dash.internal:8080", &allowed_hosts));
         assert!(!is_allowed_host("other.internal:8080", &allowed_hosts));
+    }
+
+    /// An IPv6 literal is allowed with a port or without one, and nothing else after its closing bracket.
+    #[test]
+    fn test_an_ipv6_host_allows_only_a_port_after_its_address() {
+        assert!(is_allowed_host("[::1]", &[]));
+        assert!(is_allowed_host("[::1]:8080", &[]));
+        assert!(!is_allowed_host("[::1]evil", &[]));
+        assert!(!is_allowed_host("[::1]:", &[]));
+        assert!(!is_allowed_host("[::1]:80x", &[]));
     }
 
     #[tokio::test]
@@ -1853,7 +1890,13 @@ async fn require_allowed_host(
 fn is_allowed_host(authority: &str, allowed_hosts: &[String]) -> bool {
     // An IPv6 literal is bracketed, so that its colons are not read as a port.
     if let Some(literal) = authority.strip_prefix('[') {
-        return literal.split_once(']').is_some_and(|(address, _)| address.parse::<Ipv6Addr>().is_ok());
+        return literal.split_once(']').is_some_and(|(address, rest)| {
+            address.parse::<Ipv6Addr>().is_ok()
+                && (rest.is_empty()
+                    || rest
+                        .strip_prefix(':')
+                        .is_some_and(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())))
+        });
     }
     let host = match authority.rsplit_once(':') {
         Some((host, port)) if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) => host,
@@ -1908,7 +1951,14 @@ pub(crate) async fn health(State(state): State<Arc<DashboardState>>) -> Response
             async move {
                 let mut probes = tokio::task::JoinSet::new();
                 for queue in queues {
-                    probes.spawn(async move { queue.database().dashboard_probe().await });
+                    // Logged here, once per round, so an `unhealthy` answer has a reason on record.
+                    probes.spawn(async move {
+                        let probed = queue.database().dashboard_probe().await;
+                        if let Err(error) = &probed {
+                            tracing::warn!(queue = %queue.name(), %error, "dashboard health probe failed");
+                        }
+                        probed
+                    });
                 }
                 let mut healthy = true;
                 while let Some(result) = probes.join_next().await {

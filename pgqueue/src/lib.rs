@@ -142,10 +142,11 @@ pub use worker::{
 ///
 /// The guarantee covers *scheduled* occurrences whose handlers stop when their attempt ends. Manually retrying a
 /// terminal occurrence ([`Queue::retry_job`]) deliberately produces a keyless one-off outside the schedule, which can
-/// run beside a live scheduled occurrence; see that method's documentation. And an attempt ends, releasing the key for
-/// the next occurrence, even when its handler cannot be stopped: a handler that blocks its thread past `timeout_ms`,
-/// or one still running when a shutdown gives up waiting on it, keeps running beside the next occurrence, as can an
-/// attempt whose worker's lease stalled (see [`WorkerTimers::worker_info`](crate::WorkerTimers::worker_info)).
+/// run beside a live scheduled occurrence; see that method's documentation. So does enqueueing the generated `::job()`
+/// one-off, which carries no dedupe key of its own. And an attempt ends, releasing the key for the next occurrence,
+/// even when its handler cannot be stopped: a handler that blocks its thread past `timeout_ms`, or one still running
+/// when a shutdown gives up waiting on it, keeps running beside the next occurrence, as can an attempt whose worker's
+/// lease stalled (see [`WorkerTimers::worker_info`](crate::WorkerTimers::worker_info)).
 ///
 /// Like [`macro@job`], the annotated function must be a free function at module or block scope,
 /// `#[expect(...)]` on it behaves as `#[allow(...)]`, and a `#[deprecated]` one needs
@@ -196,12 +197,23 @@ pub use worker::{
 pub use pgqueue_macros::cron;
 /// Marks an `async fn` as a job handler.
 ///
-/// The first parameter is the job's payload — use `_: ()` for a job that takes
-/// none, or `(): ()`, which `clippy::ignored_unit_patterns` accepts — and every
-/// parameter after it is an extractor ([`JobState`], [`JobContext`]). The
-/// expansion adds `::job(args)` for building an enqueue request, `::call(..)`
-/// for invoking the handler directly, and a [`JobType`] implementation carrying
-/// the configuration below.
+/// The first parameter is the job's payload — use `_: ()` for a job that takes none, or `(): ()`, which
+/// `clippy::ignored_unit_patterns` accepts — and every parameter after it is an extractor ([`JobState`],
+/// [`JobContext`]). The expansion adds `::job(args)` for building an enqueue request, `::call(..)` for invoking the
+/// handler directly, and a [`JobType`] implementation carrying the configuration below. `::call` takes every
+/// parameter, extractors included, so a test can call a handler whose extractors it can build — a [`JobState`] is a
+/// plain tuple struct — but not one that takes a [`JobContext`], which only a worker creates. The payload and return
+/// types name the [`JobType`]'s associated types, so they must be at least as visible as the function: a
+/// `pub(crate)` payload on a `pub` job is `error[E0446]`, even in a private module.
+///
+/// The job is a unit struct named after the function, which takes that name in both namespaces wherever the struct is
+/// in scope: its own module, or one that imports it. As a value it is a pattern, so outside the handler itself a
+/// `let`, parameter or closure binding of the same name matches against the struct instead of binding a value, and
+/// fails to compile. As a type it shadows a crate, or a module or type from an outer scope or a glob import, of that
+/// name, so `metrics::gauge(..)` beside a job named `metrics` no longer reaches the `metrics` crate, though
+/// `::metrics::gauge(..)` still does; and it collides (`error[E0428]`) with a module or type declared or imported by
+/// name in the same module. Elsewhere, refer to such a job by path (`jobs::report`) rather than importing it; inside
+/// its own module, rename the function and keep the stored name with `name = "..."`.
 ///
 /// The handler returns `()`, or a `Result<T, E>`: `Ok(T)` is stored as the job's JSON result, so `T` must be
 /// `Serialize + DeserializeOwned + Send + 'static` (`()` for none). `Err(E)` fails the attempt, so `E` must be
@@ -559,6 +571,11 @@ pub mod __test_support {
             let intake = crate::database::LeaseIntake::Open;
             let database = self.queue.database();
             database.renew_worker_lease(&mut self.connection, self.worker_id, stats, None, ttl, intake, deadline).await
+        }
+
+        /// The server process behind the connection the next heartbeat would write on, if one is open.
+        pub async fn backend_pid(&mut self) -> Option<i32> {
+            self.connection.backend_pid().await
         }
     }
 

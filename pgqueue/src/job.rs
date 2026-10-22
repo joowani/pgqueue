@@ -375,7 +375,7 @@ mod config_tests {
     }
 
     #[test]
-    fn test_backoff_serde_round_trip() {
+    fn test_backoff_round_trips_through_serde() {
         let none = serde_json::to_value(JobRetryBackoff::None).unwrap();
         assert_eq!(none, serde_json::json!({"type": "none"}));
         assert_eq!(serde_json::from_value::<JobRetryBackoff>(none).unwrap(), JobRetryBackoff::None);
@@ -3052,7 +3052,9 @@ impl<J: JobType> JobHandle<J> {
     /// retention fits that window and the failure's does not — the one reading the evidence supports. Reported that way
     /// whenever the row had been seen claimed, a job that *failed* and was purged on a short failure retention read as
     /// completed, as did one retried and then purged while queued, and a caller trusting that skipped work that never
-    /// succeeded. Everything else is a missing job, which errs the safe way: the caller redoes the work.
+    /// succeeded. Everything else is a missing job, which errs the safe way: the caller redoes the work. The rule
+    /// narrows that misreading rather than ending it: within the one window it still reports, a job retried and then
+    /// purged while queued reads as completed, since a poll cannot tell the two apart.
     fn vanished(&self, claimed_seen_at: Option<tokio::time::Instant>) -> Error {
         let Some(claimed_seen_at) = claimed_seen_at else {
             return Error::JobNotFound(self.id);
@@ -3202,7 +3204,9 @@ impl<J: JobType> JobHandle<J> {
                     biased;
                     _ = &mut poll_deadline => {
                         if missing {
-                            return match pending_terminal_event.take() {
+                            // `biased` reaches this arm first when the completion is ready too, so take it here
+                            // rather than read a job its event already says how it finished as merely vanished.
+                            return match pending_terminal_event.take().or_else(|| done.try_recv()) {
                                 Some(event) => resolve_deleted(event),
                                 None => Err(self.vanished(claimed_seen_at)),
                             };

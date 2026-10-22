@@ -905,6 +905,15 @@ impl WorkerBuilder {
     /// It also bounds shutdown's first durable act — closing this worker's
     /// lease to new work — except that this one step is never given less than
     /// one second, so a zero or very short grace still records the close.
+    ///
+    /// Shutdown outlasts the grace: the forced stops and their refunded
+    /// requeues happen after it, and the steps that follow each have a bound
+    /// of their own, so [`Worker::run_until`] can take up to about this grace
+    /// plus 17 seconds to return. Give the process at least that long before it
+    /// is killed. Kubernetes' default `terminationGracePeriodSeconds` of 30
+    /// equals this default grace, so raise one or lower the other; an attempt
+    /// killed before its requeue lands is recovered by the sweeper instead,
+    /// without the refund.
     pub fn shutdown_grace(mut self, grace: Duration) -> Self {
         self.shutdown_grace = grace;
         self
@@ -924,8 +933,10 @@ impl WorkerBuilder {
     /// [`Worker::run_until`]. A later call replaces the previous dashboard.
     ///
     /// The socket is bound before processing starts so address conflicts fail
-    /// fast. Use the intentionally unauthenticated `/health` endpoint rather
-    /// than a TCP-only readiness check.
+    /// fast, but requests are served only once the worker is ready: until then
+    /// a connection is accepted by the kernel and waits unanswered. Use the
+    /// intentionally unauthenticated `/health` endpoint, with a probe timeout,
+    /// rather than a TCP-only readiness check.
     /// Multiple workers in one network namespace must use distinct dashboard
     /// addresses or enable the dashboard on only one worker.
     ///
@@ -1553,7 +1564,8 @@ impl WorkerShutdown {
         // `retire_startup_lease` already bounds the identical statement by. A
         // longer grace still wins, and `run_until` stays bounded either way.
         let close_deadline = grace_deadline.max(tokio::time::Instant::now() + SHUTDOWN_STEP_TIMEOUT);
-        match tokio::time::timeout_at(close_deadline, inner.database.stop_worker_intake(inner.id)).await {
+        match tokio::time::timeout_at(close_deadline, inner.database.stop_worker_intake(inner.id, close_deadline)).await
+        {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::error!(worker.id = %inner.id, %error, "failed to close worker intake");
@@ -1732,7 +1744,8 @@ async fn before_shutdown<T>(
 /// awaits this, so a wedged backend would otherwise hang it forever.
 async fn retire_startup_lease(inner: &Arc<WorkerInner>) {
     inner.intake_open.store(false, Ordering::Release);
-    match tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, inner.database.stop_worker_intake(inner.id)).await {
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_STEP_TIMEOUT;
+    match tokio::time::timeout_at(deadline, inner.database.stop_worker_intake(inner.id, deadline)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::error!(
@@ -2355,10 +2368,11 @@ mod worker_intake_tests {
 ///
 /// Returns the error that ended the loop, if one did. Only a burst worker that
 /// spent its whole [`WorkerBuilder::dequeue_timeout`] unable to reach the
-/// database produces one; every other exit is a shutdown, which is not a
-/// failure. Whatever comes back becomes [`Worker::run_until`]'s result, because
-/// "the database was unreachable" and "the queue was empty" must not be the same
-/// answer to a burst.
+/// database, or unable to write the lease its claims need, produces one; every
+/// other exit is a shutdown, which is not a failure. Whatever comes back
+/// becomes [`Worker::run_until`]'s result, because "the database was
+/// unreachable" and "the queue was empty" must not be the same answer to a
+/// burst.
 async fn fetch_loop(
     inner: Arc<WorkerInner>,
     intake: Arc<WorkerIntake>,
@@ -2383,7 +2397,9 @@ async fn fetch_loop(
     let mut failing_since: Option<tokio::time::Instant> = None;
     // When the current run of intake-closed dequeues began *while the lease
     // could not be written*, reset by every fetch that proved the lease open
-    // and whenever the heartbeat lands again. Burst only, like the two budgets
+    // and by a closed-lease fetch that finds the heartbeat landing again. A
+    // heartbeat that lands and fails again between two fetches is not seen, so
+    // both failures count as one run. Burst only, like the two budgets
     // above: a lease this worker cannot maintain means nothing is ever
     // claimable, and the intake-closed arm cannot conclude a drain, so without
     // a bound `run_until` never returned.
@@ -2516,9 +2532,13 @@ async fn fetch_loop(
                     } else {
                         intake_closed_since = None;
                     }
-                    if !sleep_unless_stopped(&stop, Duration::from_millis(100)).await {
+                    let pause = budget_pause(unclaimable_budget, intake_closed_since, Duration::from_millis(100));
+                    if !sleep_unless_stopped(&stop, pause).await {
                         drain_on_shutdown(&inner, &intake).await;
                         return None;
+                    }
+                    if budget_spent(unclaimable_budget, intake_closed_since) {
+                        continue;
                     }
                     break;
                 }
@@ -2558,11 +2578,31 @@ async fn fetch_loop(
                         drain_on_shutdown(&inner, &intake).await;
                         return Some(error);
                     }
-                    if !sleep_unless_stopped(&stop, Duration::from_secs(1)).await {
+                    let pause = budget_pause(unclaimable_budget, failing_since, Duration::from_secs(1));
+                    if !sleep_unless_stopped(&stop, pause).await {
                         drain_on_shutdown(&inner, &intake).await;
                         return None;
                     }
+                    if budget_spent(unclaimable_budget, failing_since) {
+                        continue;
+                    }
                     break;
+                }
+            }
+        }
+        // A burst budget is only checked after a dequeue, so a running one cuts the wait short at its expiry: with a
+        // `poll_interval` longer than `dequeue_timeout`, the burst otherwise ended a poll interval late, not on budget.
+        // Only an expiry still ahead counts. The arms above fetch again at once for one that passes during their own
+        // pauses, and an unclaimable row given up leaves its clock running, so waking here for an expiry already past
+        // would spin this loop until the processors stop.
+        let now = tokio::time::Instant::now();
+        let mut next_poll = now + inner.poll_interval;
+        if let Some(budget) = unclaimable_budget {
+            for since in [unclaimable_since, failing_since, intake_closed_since].into_iter().flatten() {
+                if let Some(expiry) = since.checked_add(budget)
+                    && expiry > now
+                {
+                    next_poll = next_poll.min(expiry);
                 }
             }
         }
@@ -2573,9 +2613,24 @@ async fn fetch_loop(
             }
             _ = wakeup.recv() => {}
             _ = intake.demand.notified() => {}
-            _ = tokio::time::sleep(inner.poll_interval) => {}
+            _ = tokio::time::sleep_until(next_poll) => {}
         }
     }
+}
+
+/// `pause`, or less when a burst budget whose clock started at `since` runs out sooner, so the fetch loop's pauses do
+/// not carry a burst past its budget.
+fn budget_pause(budget: Option<Duration>, since: Option<tokio::time::Instant>, pause: Duration) -> Duration {
+    match (budget, since) {
+        (Some(budget), Some(since)) => pause.min(budget.saturating_sub(since.elapsed())),
+        _ => pause,
+    }
+}
+
+/// Whether a burst budget whose clock started at `since` has run out. The fetch loop then dequeues again at once, since
+/// that dequeue is the one that ends the burst, rather than after a poll interval.
+fn budget_spent(budget: Option<Duration>, since: Option<tokio::time::Instant>) -> bool {
+    matches!((budget, since), (Some(budget), Some(since)) if since.elapsed() >= budget)
 }
 
 async fn wait_for_dequeue_retry(stop: &CancellationToken, max_ms: u64) -> bool {
@@ -2643,37 +2698,53 @@ async fn refresh_fetcher_lease(inner: &Arc<WorkerInner>) {
 }
 
 /// Requeues buffered-but-unclaimed jobs when the worker stops taking work.
+///
+/// Each write is held to [`HARD_SHUTDOWN_TIMEOUT`], on the server as well, and a row whose write fails goes to the back
+/// of the buffer. Unbounded, one row parked behind a lock held the rest until the fetcher's hard shutdown bound aborted
+/// the drain, and every row still buffered was left `running` for the sweeper, which recovers it without the refund.
+/// The bound is the hard one, not a shutdown step's second, because a bounded write is a short transaction of several
+/// round trips, which a second would cut off on a link with a few hundred milliseconds of latency every time.
 async fn drain_on_shutdown(inner: &Arc<WorkerInner>, intake: &WorkerIntake) {
+    let step = || WriteDeadline {
+        at: tokio::time::Instant::now() + HARD_SHUTDOWN_TIMEOUT,
+        exceeded: DB_OPERATION_DEADLINE_EXCEEDED,
+    };
     loop {
         // Take the row rather than cloning it: these carry full payloads, and
         // shutdown is the worst moment to allocate a copy per iteration.
         let Some(job) = intake.lock_buffer().pop_front() else {
             return;
         };
-        let settled = match inner.database.requeue_shutdown(&job, "cancelled", None).await {
+        let bound = step();
+        let requeued = inner.database.requeue_shutdown(&job, "cancelled", Some(bound));
+        let settled = match with_db_deadline_at(bound.at, requeued).await {
             Ok(true) => true,
-            Ok(false) => match inner.database.finish(&job, JobStatus::Aborted, None, None, None).await {
-                Ok(true) => {
-                    inner.counters.record_abort();
-                    true
+            Ok(false) => {
+                let bound = step();
+                let aborted = inner.database.finish(&job, JobStatus::Aborted, None, None, Some(bound));
+                match with_db_deadline_at(bound.at, aborted).await {
+                    Ok(true) => {
+                        inner.counters.record_abort();
+                        true
+                    }
+                    Ok(false) => true,
+                    Err(error) => {
+                        tracing::error!(
+                            job.id = %job.id,
+                            %error,
+                            "failed to finalize aborted buffered job during shutdown"
+                        );
+                        false
+                    }
                 }
-                Ok(false) => true,
-                Err(error) => {
-                    tracing::error!(
-                        job.id = %job.id,
-                        %error,
-                        "failed to finalize aborted buffered job during shutdown"
-                    );
-                    false
-                }
-            },
+            }
             Err(error) => {
                 tracing::error!(job.id = %job.id, %error, "failed to requeue buffered job during shutdown");
                 false
             }
         };
         if !settled {
-            intake.lock_buffer().push_front(job);
+            intake.lock_buffer().push_back(job);
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }

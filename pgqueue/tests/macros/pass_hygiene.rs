@@ -166,7 +166,29 @@ pub mod unit_results {
     pub async fn unit_cron() {}
 }
 
+/// A type named after a primitive shadows the primitive in its module, so the expansion spells every primitive it
+/// names as `::core::primitive::*`. Written bare, `const NAME: &'static str` named the struct below instead.
+pub mod shadowed_primitives {
+    /// Shadows `str`.
+    #[allow(non_camel_case_types, dead_code)]
+    pub struct str;
+
+    /// Shadows `u64`.
+    #[allow(non_camel_case_types, dead_code)]
+    pub struct u64;
+
+    /// A job, whose name is a `str`.
+    #[pgqueue::job(max_attempts = 2, timeout_ms = 1_000)]
+    pub async fn shadowed(_: ()) {}
+
+    /// A cron, whose revision is a `u64` too.
+    #[::pgqueue::cron("* * * * *", revision = 3)]
+    pub async fn shadowed_cron() {}
+}
+
 fn main() {
+    let _ = shadowed_primitives::shadowed::job(());
+    let _ = shadowed_primitives::shadowed_cron::job();
     let _ = unit_results::implicit_unit::job(());
     let _ = unit_results::explicit_unit::job(());
     let _ = unit_results::unit_cron::job();

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use cronexpr::{FallbackTimezoneOption, ParseOptions};
 use proc_macro2::{Span, TokenStream};
+use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{Expr, ExprLit, ExprUnary, Lit, Meta, Token, UnOp};
@@ -133,14 +134,16 @@ impl JobAttrs {
 
         for meta in metas {
             match &meta {
-                Meta::Path(path) if path.is_ident("backoff") => {
+                Meta::Path(path) if path.get_ident().is_some_and(|ident| ident.unraw() == "backoff") => {
                     return Err(err(path, "`backoff` is not supported; use `max_backoff_ms = ...`"));
                 }
                 Meta::NameValue(nv) => {
+                    // Unraw, so `r#name = ...` is the key `name`, as a raw identifier is anywhere else.
                     let ident = nv
                         .path
                         .get_ident()
                         .ok_or_else(|| err(&nv.path, "expected a simple attribute name"))?
+                        .unraw()
                         .to_string();
                     if !seen.insert(ident.clone()) {
                         return Err(err(&nv.path, &format!("duplicate attribute `{ident}`")));
@@ -307,7 +310,14 @@ pub(crate) fn split_leading_str(tokens: TokenStream) -> syn::Result<(syn::LitStr
         return Err(syn::Error::new(Span::call_site(), EXPECTED));
     }
     let leading: Leading = syn::parse2(tokens)?;
+    reject_string_suffix(&leading.lit)?;
     Ok((leading.lit, leading.rest))
+}
+
+/// Refuses a suffixed string literal. `LitStr::value` drops the suffix, so `"billing"v2` read as `"billing"` and
+/// `"0 * * * *"utc` as a UTC schedule, a suffix the user wrote silently ignored, where a suffixed integer is refused.
+fn reject_string_suffix(lit: &syn::LitStr) -> syn::Result<()> {
+    if lit.suffix().is_empty() { Ok(()) } else { Err(err(lit, "expected an unsuffixed string literal")) }
 }
 
 /// Strips the invisible groups a `macro_rules!` substitution arrives in.
@@ -329,6 +339,7 @@ fn ungroup(expr: &Expr) -> &Expr {
 fn string_value(expr: &Expr) -> syn::Result<String> {
     let expr = ungroup(expr);
     if let Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) = expr {
+        reject_string_suffix(s)?;
         return Ok(s.value());
     }
     Err(err(expr, "expected a string literal"))
@@ -427,6 +438,32 @@ mod tests {
 
     fn parse(tokens: TokenStream) -> syn::Result<JobAttrs> {
         JobAttrs::parse(tokens, AttrMode::Cron)
+    }
+
+    #[test]
+    fn test_suffixed_string_literals_are_refused() {
+        let error = parse(quote!(name = "billing"v2)).unwrap_err();
+        assert!(error.to_string().contains("expected an unsuffixed string literal"), "{error}");
+        let Err(error) = split_leading_str(quote!("0 * * * *"utc)) else {
+            panic!("a suffixed cron expression must be refused");
+        };
+        assert!(error.to_string().contains("expected an unsuffixed string literal"), "{error}");
+    }
+
+    #[test]
+    fn test_raw_backoff_gets_the_backoff_hint() {
+        let error = parse(quote!(r#backoff)).unwrap_err();
+        assert!(error.to_string().contains("use `max_backoff_ms = ...`"), "{error}");
+    }
+
+    #[test]
+    fn test_raw_identifier_keys_name_their_attribute() {
+        let attrs = parse(quote!(r#name = "raw", r#max_attempts = 2)).unwrap();
+        assert_eq!(attrs.name.as_deref(), Some("raw"));
+        assert_eq!(attrs.max_attempts, Some(2));
+
+        let error = parse(quote!(name = "a", r#name = "b")).unwrap_err();
+        assert!(error.to_string().contains("duplicate attribute `name`"), "{error}");
     }
 
     #[test]

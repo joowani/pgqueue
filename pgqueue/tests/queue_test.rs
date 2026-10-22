@@ -2938,6 +2938,48 @@ async fn test_dropping_a_settled_consumer_attempt_leaves_the_row_alone(pool: PgP
     assert_eq!(db.queue.stats().aborted, 0);
 }
 
+/// A refused abort settles an attempt too. Finishing as aborted accepts every row the attempt still owns, so the
+/// refusal means the row moved on — here, recovered by the sweeper and requeued — and a consumer that followed the
+/// protocol to that point and then dropped the attempt got a recovery that could only find the same, and two warnings.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_dropping_an_attempt_whose_abort_was_refused_spawns_no_recovery(pool: PgPool) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let db = TestDb::new(pool.clone()).await;
+    let id = db
+        .queue
+        .enqueue_raw(with_config("refused-abort", |config| {
+            config.max_attempts = 2;
+            config.timeout = Some(Duration::from_millis(10));
+        }))
+        .await
+        .unwrap()
+        .unwrap();
+    let worker = Uuid::now_v7();
+    let attempt = leased_consumer(&db.queue, worker).await.dequeue(1).await.unwrap().into_iter().next().unwrap();
+    backdate_job_liveness(&db, id).await;
+    crate::expire_worker(&db, worker).await;
+    let mut sweeper = db.queue.sweeper();
+    assert_eq!(sweeper.sweep().await.unwrap().swept, vec![id]);
+    sweeper.release().await;
+
+    assert!(!attempt.finish(JobStatus::Complete, Some(json!("late")), None).await.unwrap());
+    assert!(!attempt.finish(JobStatus::Aborted, None, None).await.unwrap());
+    // Thread-local, and this runtime runs a spawned resolver on this thread, so whatever one logs lands here.
+    let recorded = RecordedMessages::default();
+    let guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry::Registry::default().with(recorded.clone()));
+    drop(attempt);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(guard);
+    let resolver_logs =
+        recorded.recorded().into_iter().filter(|message| message.contains("dropped")).collect::<Vec<_>>();
+    assert!(resolver_logs.is_empty(), "a refused abort left the attempt unsettled: {resolver_logs:?}");
+    let row = db.queue.fetch_job(id).await.unwrap().unwrap();
+    assert_eq!(row.status, JobStatus::Queued);
+    assert_eq!(row.attempts, 1);
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn test_dequeue_respects_limit_schedule_and_priority_range(pool: PgPool) {
     let db = TestDb::new(pool.clone()).await;
@@ -4138,6 +4180,25 @@ async fn test_user_abort_claims_a_sweeper_marked_aborting_job(pool: PgPool) {
     assert_eq!(row.error.as_deref(), Some("operator said stop"));
     assert_eq!(db.queue.stats().retried, 0, "the sweeper retry never ran");
     sweeper.release().await;
+}
+
+/// A closed pool never reopens, so its sweeper gives up leadership at its first failed pass rather than after the
+/// consecutive failures an outage is given: its leadership connection is detached from the pool and still answers,
+/// and held the lock, with nothing sweeping, for as long as that took.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_a_sweeper_whose_pool_closed_releases_leadership_at_once(pool: PgPool) {
+    let closing = TestDb::new(crate::pool_with_max(&pool, 2).await).await.queue;
+    let mut leader = closing.sweeper();
+    assert!(leader.sweep().await.unwrap().leader);
+
+    closing.pool().close().await;
+    leader.sweep().await.expect_err("a closed pool cannot sweep");
+    assert!(!leader.is_leader(), "a sweeper whose pool closed kept leadership");
+
+    let db = TestDb::new(pool.clone()).await;
+    let mut successor = db.queue.sweeper();
+    assert!(successor.sweep().await.unwrap().leader, "leadership must pass to a live sweeper");
+    successor.release().await;
 }
 
 #[sqlx::test(migrations = "./migrations")]

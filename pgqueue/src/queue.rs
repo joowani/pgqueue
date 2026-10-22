@@ -175,6 +175,11 @@ impl QueueDoneSubscription {
             None => std::future::pending().await,
         }
     }
+
+    /// A completion already delivered, without waiting for one.
+    pub(crate) fn try_recv(&mut self) -> Option<QueueDoneEvent> {
+        self.receiver.try_recv().ok()
+    }
 }
 
 impl Drop for QueueDoneSubscription {
@@ -347,7 +352,8 @@ impl QueueNotifyListener {
                 };
                 match received {
                     Ok(Some(notification)) => {
-                        health_tx.send_replace(None);
+                        // Only a change wakes the health subscribers, not every notification.
+                        health_tx.send_if_modified(|health| health.take().is_some());
                         if notification.channel() == done_channel {
                             match serde_json::from_str::<QueueDoneEvent>(notification.payload()) {
                                 Ok(event) => {
@@ -446,8 +452,8 @@ pub struct Queue {
 /// themselves without passing forgeable row snapshots back to [`Queue`]. A
 /// custom consumer must call [`Consumer::heartbeat`] before dequeueing and keep
 /// that lease alive while attempts run. Without a live lease, an attempt becomes
-/// sweepable a sweep grace past its last heartbeat — a timeout, however long,
-/// buys no slack against that, since the two recovery triggers are additive.
+/// sweepable a sweep grace past the lease's expiry — a timeout, however long,
+/// buys no slack against that, since the two recovery triggers are independent.
 ///
 /// The identity is one *incarnation*, not a stable name — see
 /// [`Queue::consumer`] for the lifecycle rule and what reusing an id across
@@ -462,10 +468,16 @@ pub struct Queue {
 /// as complete or failed answers `false`, acknowledge the abort by finishing
 /// as aborted. A long-running handler that should *react* to aborts before it
 /// ends must poll [`Queue::fetch_job`] itself — the row's `aborting` status,
-/// `attempts` and `worker_id` are exactly what the worker's own poll reads —
-/// and per-attempt timeouts are likewise the worker's feature: for an attempt
-/// the consumer is still holding, the backstops are lease expiry and the
-/// drop recovery on [`Attempt`] itself.
+/// `attempts` and `worker_id` are exactly what the worker's own poll reads.
+///
+/// Nothing here cancels an attempt at its timeout either, but the sweeper still
+/// applies the timeout under a live lease. An attempt held past the job's
+/// `timeout_ms` plus the sweep grace is marked `aborting`, which a later finish
+/// still accepts. Once a further sweep grace has passed, a final attempt with
+/// no dedupe key is finished as aborted, after which the consumer's finish
+/// answers `false` and its result is lost; any other stays `aborting`, holding
+/// its dedupe key, until the consumer settles it. Give a job that a consumer
+/// may hold for long a timeout to match, or none (`timeout_ms = 0`).
 #[derive(Clone)]
 pub struct Consumer {
     queue: Queue,
@@ -475,11 +487,13 @@ pub struct Consumer {
 /// One dequeued attempt owned by a [`Consumer`].
 ///
 /// Dropping an attempt that never settled — no [`Attempt::finish`] or
-/// [`Attempt::retry`] answered `Ok(true)` — hands it to a background recovery
+/// [`Attempt::retry`] answered `Ok(true)`, and no finish as aborted was
+/// refused — hands it to a background recovery
 /// task rather than abandoning it: the consumer's own task may have panicked
 /// or been cancelled while its heartbeat loop runs on, and a heartbeat is
 /// precisely the assertion that every claimed attempt is still being worked,
-/// so nothing else would ever reclaim an untimed one. The recovery requeues
+/// so nothing else would ever reclaim an untimed one, nor a timed one beyond
+/// what the sweeper does at its timeout (see [`Consumer`]). The recovery requeues
 /// the attempt (spending it, with the job's own retry delay) or, when no
 /// attempts remain or an abort landed meanwhile, finishes it aborted; every
 /// transition is guarded, so a row that already moved on is left alone.
@@ -570,7 +584,9 @@ impl Attempt {
     /// infrastructure error or apply a fallback after a refused transition.
     pub async fn finish(&self, status: JobStatus, result: Option<Value>, error: Option<&str>) -> Result<bool, Error> {
         let finished = self.queue.database.finish(&self.row, status, result, error, None).await?;
-        if finished {
+        // A refused abort settles it too: finishing as aborted accepts every row this attempt still owns, so the
+        // refusal means the row has moved on, and the drop recovery could only find the same.
+        if finished || status == JobStatus::Aborted {
             self.settled.store(true, std::sync::atomic::Ordering::Release);
         }
         Ok(finished)
@@ -598,7 +614,8 @@ impl Attempt {
 
 impl Drop for Attempt {
     fn drop(&mut self) {
-        // Only a transition this capability *made* settles it. A refused one —
+        // Only a transition this capability *made* settles it, or a refused
+        // abort, which only a row that moved on refuses. Any other refused one —
         // `Ok(false)` — deliberately does not: the refusal may mean the row is
         // an abort awaiting acknowledgment or an exhausted final attempt, and
         // if the caller drops instead of following the documented protocol,
@@ -888,8 +905,10 @@ impl Queue {
     /// only the id: a restart that reuses its predecessor's id renews the
     /// predecessor's lease too, asserting attempts the new process has no
     /// [`Attempt`] for are alive. Those attempts then never meet the dead-owner
-    /// recovery trigger, and one with its timeout disabled is stranded
-    /// `running` for as long as the reused id keeps heartbeating.
+    /// recovery trigger. One with its timeout disabled is stranded `running`,
+    /// and a timed one is marked `aborting` past its timeout plus the sweep
+    /// grace but, unless it is a final attempt with no dedupe key, stays there,
+    /// holding its dedupe key — for as long as the reused id keeps heartbeating.
     pub fn consumer(&self, worker_id: Uuid) -> Consumer {
         Consumer { queue: self.clone(), worker_id }
     }
@@ -976,8 +995,9 @@ impl Queue {
     }
 
     /// Creates a fresh occurrence of a terminal job with one more attempt.
-    /// The terminal row remains unchanged so existing handles keep observing
-    /// its result. A terminal occurrence can be retried once; returns `false`
+    /// The terminal row keeps its status and result, so existing handles keep
+    /// observing them; only its `retried_at` is stamped, which refuses a second
+    /// retry. A terminal occurrence can be retried once; returns `false`
     /// if it is not terminal, was already retried, or its dedupe key already
     /// belongs to a live occurrence.
     ///

@@ -13,6 +13,7 @@ Async and cron jobs for Rust, backed by PostgreSQL 18+.
 
 - Rust 1.98.1 or newer.
 - PostgreSQL 18 or newer, with `fsync` and `synchronous_commit` on to guarantee delivery.
+- A `read committed` `default_transaction_isolation` (PostgreSQL's default) for the database role PGQueue uses.
 - A direct connection or a session-pooling proxy. PgBouncer transaction and statement pooling are unsupported.
 
 ## Quick Start
@@ -243,11 +244,11 @@ async fn main() -> anyhow::Result<()> {
 ```
 
 The server speaks plain HTTP and sets `Secure` session cookies, so serve it through a reverse proxy that terminates
-TLS. Have the proxy forward the client's `Host` header and append the client's address to `X-Forwarded-For`; nginx
-does neither by default:
+TLS. Have the proxy forward the client's `Host` header, port included, and append the client's address to
+`X-Forwarded-For`; nginx does neither by default:
 
 ```nginx
-proxy_set_header Host $host;
+proxy_set_header Host $http_host;
 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 ```
 
@@ -266,7 +267,7 @@ more restricted role, apply migrations as the owner of the `pgqueue` schema with
 same release, since the command applies every migration it carries:
 
 ```sh
-cargo install pgqueue --version =0.3.1 --locked
+cargo install pgqueue --version =0.3.2 --locked
 DATABASE_URL=postgres://schema_owner@localhost/app pgqueue-migrate
 ```
 

@@ -100,7 +100,8 @@ const V0_1_MIGRATION_1_CHECKSUM: [u8; 48] = [
 /// What 0.2.0's in-place edit added to migration 1, in the same definitions `0001_migration.sql` carries. A released
 /// migration can no longer change, which a test pins, so this copy cannot drift from it, and another test compares a
 /// repaired schema with a fresh one. Every statement is idempotent, and the column's constant default makes adding it
-/// a catalog change rather than a rewrite of the table.
+/// a catalog change rather than a rewrite of the table. Adding the range check does read every row, though, under the
+/// `ACCESS EXCLUSIVE` lock the column took, so a large 0.1.0 table stalls the queue for that one scan as it upgrades.
 const V0_1_REPAIR_SQL: &str = r#"
 ALTER TABLE pgqueue.jobs ADD COLUMN IF NOT EXISTS refunds integer NOT NULL DEFAULT 0;
 ALTER TABLE pgqueue.jobs DROP CONSTRAINT IF EXISTS jobs_refunds_range_check;
@@ -1535,11 +1536,16 @@ pub(crate) struct WriteDeadline {
 /// What a worker reports for a lease write that reached its deadline, on either side.
 pub(crate) const LEASE_WRITE_DEADLINE_EXCEEDED: &str = "worker lease heartbeat exceeded its deadline";
 
+/// What [`Database::stop_worker_intake`] reports when the server ends its lock wait at the deadline.
+const INTAKE_CLOSE_DEADLINE_EXCEEDED: &str = "closing the worker's intake exceeded its deadline";
+
 /// The connection a worker's heartbeat loop renews its lease on, held outside its queue's pool; see
 /// [`Database::renew_worker_lease`].
 #[derive(Default)]
 pub(crate) struct LeaseConnection {
     connection: Option<PgConnection>,
+    /// When `connection` was opened, so [`Database::renew_worker_lease`] retires it at [`lease_connection_lifetime`].
+    opened_at: Option<tokio::time::Instant>,
     /// Set while a heartbeat writes on `connection`. Still set when the next one starts, the last was dropped with its
     /// future mid-write, which leaves the connection in a state nothing knows, so it is not used again.
     writing: bool,
@@ -1550,6 +1556,7 @@ pub(crate) struct LeaseConnection {
 
 impl LeaseConnection {
     fn opened(&mut self, queue: &str, worker_id: Uuid) {
+        self.opened_at = Some(tokio::time::Instant::now());
         if std::mem::take(&mut self.refused) {
             tracing::info!(
                 queue, worker.id = %worker_id,
@@ -1558,7 +1565,15 @@ impl LeaseConnection {
         }
     }
 
+    /// The server process behind the connection the next heartbeat would write on, if one is open.
+    #[cfg(feature = "_test")]
+    pub(crate) async fn backend_pid(&mut self) -> Option<i32> {
+        let connection = self.connection.as_mut()?;
+        sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()").fetch_one(connection).await.ok()
+    }
+
     fn discard(&mut self) {
+        self.opened_at = None;
         if let Some(connection) = self.connection.take() {
             close_lease_connection(connection);
         }
@@ -1580,6 +1595,25 @@ impl Drop for LeaseConnection {
     fn drop(&mut self) {
         self.discard();
     }
+}
+
+/// The longest a lease connection is kept when the pool sets no `max_lifetime` of its own: sqlx's default for it.
+const LEASE_CONNECTION_MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
+/// How long [`Database::renew_worker_lease`] keeps one lease connection: the pool's own `max_lifetime`, within
+/// [`LEASE_CONNECTION_MAX_LIFETIME`].
+///
+/// The lease asserts that this worker can still work its attempts, but its connection is not the one the work uses.
+/// Kept for good, it went on renewing the lease of a worker whose pool could no longer connect — a host that refuses
+/// new flows but keeps established ones, as exhausted conntrack or SNAT tables and some firewall changes do — once the
+/// pool had retired its own connections at their lifetime. Dequeues, finalizations and abort polls all failed, and the
+/// sweeper, which leaves a live lease's attempts alone, never recovered them. Retired as the pool retires its own, the
+/// lease connection meets the same refusal when it is reopened, the heartbeat falls back to the pool, which fails it
+/// too, and the lease lapses for the sweeper to act on.
+fn lease_connection_lifetime(pool: &PgPool) -> Duration {
+    pool.options()
+        .get_max_lifetime()
+        .map_or(LEASE_CONNECTION_MAX_LIFETIME, |lifetime| lifetime.min(LEASE_CONNECTION_MAX_LIFETIME))
 }
 
 /// How long a discarded lease connection is given to close gracefully.
@@ -3339,12 +3373,14 @@ impl Database {
     /// One periodic heartbeat of a worker's lease: [`Database::write_worker_lease_within`] on `lease`, a connection of
     /// the heartbeat loop's own outside the pool, with opening it counted against `deadline` as well. A heartbeat that
     /// does not land discards the connection, and the next opens a fresh one; see `worker::heartbeat_deadline` for why
-    /// the pool could not hold a heartbeat to its deadline.
+    /// the pool could not hold a heartbeat to its deadline. The connection is also replaced once it has been open for
+    /// [`lease_connection_lifetime`], so the lease outlives the pool's ability to connect by at most that long.
     ///
     /// Only a connection that cannot be opened — a server or role out of connections, a proxy refusing one more, or
     /// queueing it — sends the heartbeat to the pool instead. The lease is what keeps this worker's attempts its own,
     /// and a worker whose pool still works has to keep it whatever happens to one more connection; the next heartbeat
-    /// tries to open one again.
+    /// tries to open one again. On the pool, the heartbeat is the pool path's own: it waits its turn for a connection,
+    /// and its write then gets a whole `deadline`, whatever opening the refused connection took.
     #[expect(clippy::too_many_arguments, reason = "the lease write's own arguments, and the connection to make it on")]
     pub(crate) async fn renew_worker_lease(
         &self,
@@ -3357,9 +3393,17 @@ impl Database {
         deadline: Duration,
     ) -> Result<(), Error> {
         validate_worker_info(&stats, metadata.as_ref(), ttl)?;
+        // The lease's connection is opened from the pool's options rather than taken from it, so it would go on
+        // renewing a lease a closed pool can no longer do any work under.
+        if self.pool.is_closed() {
+            lease.discard();
+            return Err(Error::Db(sqlx::Error::PoolClosed));
+        }
         let bound =
             WriteDeadline { at: tokio::time::Instant::now() + deadline, exceeded: LEASE_WRITE_DEADLINE_EXCEEDED };
-        if std::mem::take(&mut lease.writing) {
+        if std::mem::take(&mut lease.writing)
+            || lease.opened_at.is_some_and(|opened| opened.elapsed() >= lease_connection_lifetime(&self.pool))
+        {
             lease.discard();
         }
         let connection = match lease.connection.take() {
@@ -3441,17 +3485,26 @@ impl Database {
         .bind(intake.accepts_when_created())
     }
 
-    pub(crate) async fn stop_worker_intake(&self, worker_id: Uuid) -> Result<(), Error> {
-        sqlx::query(
+    /// Closes `worker_id`'s lease to new work, as a [`bounded_write`] whose wait for the lease row's lock ends on the
+    /// server at `deadline`. Its callers give up on it at the same moment, and a write abandoned on the client alone
+    /// stayed queued behind an outside lock on the row — an operator's `SELECT ... FOR UPDATE` — holding a pooled
+    /// connection, and a server backend past the process's exit, for as long as the lock was held.
+    pub(crate) async fn stop_worker_intake(
+        &self,
+        worker_id: Uuid,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), Error> {
+        let query = sqlx::query(
             r#"
             UPDATE pgqueue.workers SET accepting = false, heartbeat_at = now()
             WHERE id = $1 AND queue = $2
             "#,
         )
         .bind(worker_id)
-        .bind(&self.name)
-        .execute(&self.pool)
-        .await?;
+        .bind(&self.name);
+        let bound = WriteDeadline { at: deadline, exceeded: INTAKE_CLOSE_DEADLINE_EXCEEDED };
+        let mut connection = PoolConnectionGuard::new(self.pool.acquire().await?);
+        bounded_write(&mut connection, bound, async move |connection| query.execute(connection).await).await?;
         Ok(())
     }
 
@@ -3522,7 +3575,7 @@ impl Database {
     /// Requeues an attempt the sweeper marked for abort, on behalf of the
     /// worker that still owns it. The sweeper's own recovery of an abandoned
     /// attempt goes through [`Database::retry_swept_abandoned_batch`], which
-    /// carries the extra stuckness and dead-owner guards that path needs.
+    /// carries the extra dead-owner and cooperative-window guards that path needs.
     ///
     /// `error` is what the attempt ended with, when it ended with something the
     /// operator needs to see: a handler failure that raced the sweeper's abort
@@ -3990,8 +4043,9 @@ impl Database {
     }
 
     /// Requeues a batch of abandoned, sweeper-marked attempts in one statement.
-    /// The per-row attempt/worker/stuckness guards and retry delays ride along
-    /// through `unnest`, exactly as phase one's abort marking does, and so does
+    /// The per-row attempt and worker guards and retry delays ride along
+    /// through `unnest`, exactly as phase one's abort marking does — stuckness
+    /// is the marker pair itself, not re-derived here — and so does
     /// its `SKIP LOCKED`: a row another transaction holds locked waits for a
     /// later pass rather than stalling the whole batch (see the sweeper's
     /// `recover_stuck_jobs`).

@@ -2784,6 +2784,80 @@ async fn test_burst_fails_instead_of_hanging_when_dequeues_keep_failing(pool: Pg
     );
 }
 
+/// A burst's budgets are checked after a dequeue, and between dequeues the fetch loop waits out its `poll_interval`.
+/// With an interval longer than the budget, a burst whose dequeues kept failing returned a whole interval late — about
+/// 30s here — so the wait is cut short where a running budget expires. So is the second's pause after each failure: a
+/// budget that ran out inside it was otherwise past by the time the wait was capped, and waited the interval anyway.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_burst_fails_on_its_dequeue_timeout_whatever_its_poll_interval(pool: PgPool) {
+    let db = TestDb::new(pool_with_max(&pool, 2).await).await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(
+        "CREATE FUNCTION pgqueue.repro_fail_dequeue() RETURNS trigger
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'dequeue is unavailable'; END $$;
+         CREATE TRIGGER repro_fail_dequeue
+         BEFORE UPDATE ON pgqueue.jobs
+         FOR EACH STATEMENT EXECUTE FUNCTION pgqueue.repro_fail_dequeue();"
+            .to_string(),
+    ))
+    .execute(db.queue.pool())
+    .await
+    .unwrap();
+
+    // Inside the pause after a failure, and past it.
+    for budget in [Duration::from_millis(500), Duration::from_secs(3)] {
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(15),
+            test_worker(db.queue.clone())
+                .register_job(counts)
+                .state(Arc::new(AtomicU32::new(0)))
+                .poll_interval(Duration::from_secs(30))
+                .concurrency(1)
+                .burst(true)
+                .dequeue_timeout(budget)
+                .max_burst_jobs(1)
+                .build()
+                .unwrap()
+                .run_until(CancellationToken::new()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{budget:?}: a burst must fail on its dequeue timeout, not a poll interval later"))
+        .expect_err("a burst that never reached the database must not report a drain");
+        assert!(error.to_string().contains("dequeue is unavailable"), "{budget:?}: {error}");
+        assert!(started.elapsed() >= budget, "{budget:?}: the burst failed before its budget: {:?}", started.elapsed());
+    }
+}
+
+/// The unclaimable half: a due row held under a lock is given up once the budget runs out, not a poll interval later.
+//noinspection SqlNoDataSourceInspection
+#[sqlx::test(migrations = "./migrations")]
+async fn test_burst_gives_up_a_locked_row_on_its_dequeue_timeout_whatever_its_poll_interval(pool: PgPool) {
+    let control = TestDb::new(pool_with_max(&pool, 2).await).await.queue;
+    let db = TestDb::new(pool_with_max(&pool, 1).await).await;
+    let handle = db.queue.enqueue(counts::job(())).await.unwrap().unwrap();
+    let mut lock = control.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM pgqueue.jobs WHERE id = $1 FOR UPDATE")
+        .bind(handle.id())
+        .fetch_one(&mut *lock)
+        .await
+        .unwrap();
+
+    let worker = test_worker(db.queue.clone())
+        .register_job(counts)
+        .state(Arc::new(AtomicU32::new(0)))
+        .poll_interval(Duration::from_secs(30))
+        .burst(true)
+        .dequeue_timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), worker.run_until(CancellationToken::new()))
+        .await
+        .expect("a burst must give up a locked row on its dequeue timeout, not a poll interval later")
+        .unwrap();
+    assert_eq!(handle.fetch_job().await.unwrap().status, JobStatus::Queued);
+    lock.rollback().await.unwrap();
+}
+
 /// The finalization half of the same contract. `finalize` retries a failed outcome write for as long as the attempt
 /// lives, and in a burst nothing ever ended that: with every processor pinned in the retry loop none goes idle, so the
 /// fetch loop never dequeues and the failed-dequeue budget above is never spent. A burst whose database became
@@ -7065,6 +7139,54 @@ async fn test_a_heartbeat_blocked_on_its_lease_row_gives_its_connection_back(poo
 
     operator.rollback().await.unwrap();
     lease.renew(ttl, Duration::from_secs(5)).await.expect("released, the lease row takes the next heartbeat");
+}
+
+/// The heartbeat's own connection is retired at the pool's `max_lifetime`, as the pool retires its own. Kept for good,
+/// it went on renewing the lease of a worker whose pool could no longer connect — a host refusing new flows but keeping
+/// established ones — so the sweeper never recovered the attempts that worker could no longer finish.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_a_heartbeat_retires_its_own_connection_at_the_pools_max_lifetime(pool: PgPool) {
+    let lifetime = Duration::from_millis(500);
+    let pooled = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .max_lifetime(lifetime)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let queue = Queue::builder("postgres://unused").pool(pooled).connect().await.unwrap();
+    let worker_id = Uuid::now_v7();
+    let ttl = Duration::from_secs(30);
+    let mut lease = pgqueue::__test_support::WorkerLease::new(&queue, worker_id);
+    let started = std::time::Instant::now();
+    lease.renew(ttl, LANDING_DEADLINE).await.expect("the first heartbeat opens the lease's own connection");
+    let first = lease.backend_pid().await.expect("the lease keeps its connection after a heartbeat lands");
+    lease.renew(ttl, LANDING_DEADLINE).await.unwrap();
+    // The connection opened after `started`, so a heartbeat that checked its age before now saw less than this.
+    if started.elapsed() < lifetime {
+        assert_eq!(lease.backend_pid().await, Some(first), "a heartbeat within the lifetime keeps its connection");
+    }
+
+    tokio::time::sleep(lifetime + Duration::from_millis(100)).await;
+    lease.renew(ttl, LANDING_DEADLINE).await.expect("a heartbeat past the lifetime lands on a fresh connection");
+    let replaced = lease.backend_pid().await.expect("the lease keeps its new connection");
+    assert_ne!(replaced, first, "the heartbeat past the lifetime kept its connection");
+}
+
+/// The heartbeat's own connection is opened from the pool's options, not taken from the pool, so closing the pool
+/// left it renewing the lease of a worker that could no longer dequeue, finalize or abort anything, and the sweeper,
+/// which leaves a live lease's attempts alone, never recovered them.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_a_heartbeat_does_not_renew_the_lease_of_a_closed_pool(pool: PgPool) {
+    let queue = TestDb::new(pool_with_max(&pool, 2).await).await.queue;
+    let ttl = Duration::from_secs(30);
+    let mut lease = pgqueue::__test_support::WorkerLease::new(&queue, Uuid::now_v7());
+    lease.renew(ttl, LANDING_DEADLINE).await.expect("the first heartbeat opens the lease's own connection");
+    assert!(lease.backend_pid().await.is_some());
+
+    queue.pool().close().await;
+    let error = lease.renew(ttl, LANDING_DEADLINE).await.expect_err("a closed pool's lease is not renewed");
+    assert!(matches!(error, Error::Db(sqlx::Error::PoolClosed)), "{error}");
+    assert_eq!(lease.backend_pid().await, None, "the lease's own connection is closed with the pool");
 }
 
 /// A queue whose pool of `size` connections, every one of them open and idle, reaches the test database through a
