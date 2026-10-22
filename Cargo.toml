@@ -34,19 +34,19 @@ authors = ["Joohwan Oh <joohwan.oh@outlook.com>"]
 [workspace.dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
-cronexpr = "1.6.0"
+cronexpr = "1.7.0"
 include_dir = "0.7.4"
-hyper = { version = "1.10.1", features = ["http1", "server"] }
-hyper-util = { version = "0.1.20", features = ["tokio"] }
-jiff = { version = "0.2.35", features = ["serde"] }
+hyper = { version = "1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+jiff = { version = "0.2.38", features = ["serde"] }
 jiff-sqlx = { version = "0.2.0", features = ["postgres"] }
 pgqueue-macros = { path = "pgqueue-macros", version = "=0.3.2" }
 proc-macro-crate = "3.5.0"
 proc-macro2 = "1.0.107"
 quote = "1.0.47"
-rand = "0.10.2"
+rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 sqlx = { version = "0.9.0", default-features = false, features = [
     "postgres",
     "runtime-tokio",
@@ -58,18 +58,18 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "uuid",
     "json",
 ] }
-syn = { version = "3.0.3", features = ["full", "visit"] }
-thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = [
+syn = { version = "3.0.9", features = ["full", "visit"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = [
     "macros",
     "rt",
     "signal",
     "sync",
     "time",
 ] }
-tokio-util = { version = "0.7.19", features = ["rt"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
 tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-trybuild = "1.0.120"
-uuid = { version = "1.24.0", features = ["v7", "serde"] }
+trybuild = "1.0.122"
+uuid = { version = "1.28.0", features = ["v7", "serde"] }
