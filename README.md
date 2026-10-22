@@ -267,7 +267,7 @@ more restricted role, apply migrations as the owner of the `pgqueue` schema with
 same release, since the command applies every migration it carries:
 
 ```sh
-cargo install pgqueue --version =0.3.2 --locked
+cargo install pgqueue --version =0.3.3 --locked
 DATABASE_URL=postgres://schema_owner@localhost/app pgqueue-migrate
 ```
 
