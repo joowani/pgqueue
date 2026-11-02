@@ -195,8 +195,21 @@ async fn repair_v0_1_schema(connection: &mut PgConnection) -> Result<(), sqlx::m
     Ok(())
 }
 
-async fn find_applied_migrations(connection: &mut PgConnection) -> Result<Vec<AppliedMigration>, sqlx::Error> {
-    sqlx::query_as::<_, AppliedMigration>(
+/// Reads the migration history, or `None` where there is none yet.
+///
+/// The history table's existence is checked first, with `to_regclass`, which answers NULL for a missing table or
+/// schema instead of failing. Reading a missing table and catching its `undefined_table` error worked too, but the
+/// server logs every such error, so each fresh install left two `relation "pgqueue.migrations" does not exist` ERROR
+/// lines in its log, one for each status check. The error is still caught, for a history dropped between the check
+/// and the read.
+async fn find_applied_migrations(connection: &mut PgConnection) -> Result<Option<Vec<AppliedMigration>>, sqlx::Error> {
+    let exists = sqlx::query_scalar::<_, bool>("SELECT to_regclass('pgqueue.migrations') IS NOT NULL")
+        .fetch_one(&mut *connection)
+        .await?;
+    if !exists {
+        return Ok(None);
+    }
+    let applied = sqlx::query_as::<_, AppliedMigration>(
         r#"
         SELECT version, checksum, success
         FROM pgqueue.migrations
@@ -204,16 +217,17 @@ async fn find_applied_migrations(connection: &mut PgConnection) -> Result<Vec<Ap
         "#,
     )
     .fetch_all(connection)
-    .await
+    .await;
+    match applied {
+        Ok(applied) => Ok(Some(applied)),
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some(UNDEFINED_TABLE) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 async fn find_migration_status(connection: &mut PgConnection) -> Result<MigrationStatus, Error> {
-    let applied = match find_applied_migrations(connection).await {
-        Ok(applied) => applied,
-        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some(UNDEFINED_TABLE) => {
-            return Ok(MigrationStatus::Pending { repair_v0_1: false });
-        }
-        Err(error) => return Err(error.into()),
+    let Some(applied) = find_applied_migrations(connection).await? else {
+        return Ok(MigrationStatus::Pending { repair_v0_1: false });
     };
 
     for row in &applied {

@@ -1192,6 +1192,36 @@ async fn test_connect_migrates_an_existing_schema_without_the_database_create_pr
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP OWNED BY {role}; DROP ROLE {role}"))).execute(&pool).await.unwrap();
 }
 
+/// The server logs every statement that fails, so a migration status check that read the missing history table and
+/// caught the error left two `relation "pgqueue.migrations" does not exist` ERROR lines in a fresh install's log. A
+/// failed statement rolls back its transaction, which the database's statistics count, so connecting must count none.
+#[sqlx::test(migrations = false)]
+async fn test_connect_causes_no_error_on_a_fresh_database(pool: PgPool) {
+    // `pg_stat_force_next_flush` makes the session report its statistics as it goes idle, so the next statement on the
+    // same connection reads them current.
+    async fn rollbacks(pool: &PgPool) -> i64 {
+        sqlx::query("SELECT pg_stat_force_next_flush()").execute(pool).await.unwrap();
+        sqlx::query_scalar("SELECT xact_rollback FROM pg_stat_database WHERE datname = current_database()")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+    // One connection, so every statement the connect runs is reported by the session the counts are read from.
+    let shared = crate::pool_with_max(&pool, 1).await;
+    let before = rollbacks(&shared).await;
+
+    let queue = Queue::builder("postgres://unused").pool(shared.clone()).connect().await.unwrap();
+    let after = rollbacks(&shared).await;
+    assert_eq!(after - before, 0, "connecting to a fresh database must not run a failing statement");
+    let versions = sqlx::query_scalar::<_, i64>("SELECT version FROM pgqueue.migrations ORDER BY version")
+        .fetch_all(&shared)
+        .await
+        .unwrap();
+    assert_eq!(versions, crate::migration_versions());
+    drop(queue);
+    shared.close().await;
+}
+
 /// GRANT and REVOKE by a role that holds privileges on the tables but cannot act as their owner only warn, so a
 /// migration made of them would be recorded as applied while changing nothing: an application role granted everything
 /// on a 0.2.0 schema connected first and left `pg_monitor` reading every payload for good. Migration 2 checks its own
