@@ -9,7 +9,9 @@ set -euo pipefail
 source "${BASH_SOURCE[0]%/*}/migrate"
 
 # Reset the query-count table, which fills with dead test databases and then evicts rows the tests measure against.
-psql "$DATABASE_URL" -Atc "SELECT pg_stat_statements_reset()" >/dev/null 2>&1 || true
+# Run psql in the Compose container, so the host needs no PostgreSQL client.
+docker compose exec -T postgres psql --username=pgqueue --dbname=pgqueue -Atc "SELECT pg_stat_statements_reset()" \
+    >/dev/null 2>&1 || true
 
 # Each SQLx test owns its database, so the cases run in parallel, one per CPU. Tests with timing assertions must leave
 # room for a machine busy with the rest of the suite. Forward arguments so a run can be narrowed, as in
