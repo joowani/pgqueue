@@ -2151,6 +2151,7 @@ async fn test_cron_publishes_nothing_while_another_transaction_holds_the_schedul
         .build()
         .unwrap();
     let health = worker.health();
+    let (warnings, _recording) = RecordedWarnings::start();
     let shutdown = CancellationToken::new();
     let run = tokio::spawn(worker.run_until(shutdown.clone()));
 
@@ -2159,37 +2160,8 @@ async fn test_cron_publishes_nothing_while_another_transaction_holds_the_schedul
     })
     .await;
 
-    // Arming the schedule and locking it are two transactions, and a scheduler
-    // tick fits between them: the tick claims the row first, publishes the
-    // occurrence and advances the cursor a whole hour, so the lock lands on a
-    // row that is no longer due. The scheduler then rolls back at its due check
-    // without ever reaching the claim below, and the wait for that claim times
-    // out 30 seconds later — the setup losing a race, reported as the behaviour
-    // under test failing. The armed cursor comes back verbatim while nothing
-    // else has written the row, so an inequality is exactly "a tick got there
-    // first": drop the lock and arm it again.
-    let (holder, held) = 'armed: {
-        for _ in 0..10 {
-            let armed = set_cron_due(&pool, db.queue.name(), key, None).await;
-            let mut holder = pool.begin().await.unwrap();
-            let held = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
-                "SELECT next_run_at FROM pgqueue.cron_schedules
-                 WHERE queue = $1 AND dedupe_key = $2 FOR UPDATE",
-            )
-            .bind(db.queue.name())
-            .bind(key)
-            .fetch_optional(&mut *holder)
-            .await
-            .unwrap()
-            .map(jiff_sqlx::Timestamp::to_jiff)
-            .expect("the reconciled schedule row");
-            if held == armed {
-                break 'armed (holder, Some(held));
-            }
-            holder.rollback().await.unwrap();
-        }
-        panic!("the scheduler published the armed occurrence before the lock landed, ten times over");
-    };
+    let (holder, held) = hold_due_schedule(&pool, db.queue.name(), key).await;
+    let held = Some(held);
     let published = cron_job_count(&pool, db.queue.name(), key).await;
 
     // The window is the scheduler's own passes, not a stretch of wall clock: a
@@ -2229,6 +2201,7 @@ async fn test_cron_publishes_nothing_while_another_transaction_holds_the_schedul
         },
     )
     .await;
+    assert_eq!(warnings.count(OCCURRENCE_DEFERRED), 1, "a run of contended passes warns once");
 
     holder.rollback().await.unwrap();
     wait_until(
@@ -2248,6 +2221,159 @@ async fn test_cron_publishes_nothing_while_another_transaction_holds_the_schedul
 
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(10), run).await.unwrap().unwrap().unwrap();
+}
+
+/// The statement a scheduling pass runs after an empty claim, to tell a locked row from one a peer just published.
+/// Once it has run, the pass has decided whether the row was contended.
+const CRON_SCHEDULE_RECHECK: &str = "%SELECT EXISTS (%FROM pgqueue.cron_schedules%next_run_at <= now()%";
+
+/// The warning a scheduling pass logs for a due cron whose schedule row stays locked.
+const OCCURRENCE_DEFERRED: &str =
+    "cron schedule row or dedupe key is locked by another transaction; occurrence deferred";
+
+/// A peer holds a due cron's schedule row only while it publishes the occurrence, and the passes of workers sharing
+/// crons overlap on most occurrences, so a pass that finds the row held once and the next one finds it published must
+/// not warn: warning on the first pass logged a warning for most occurrences of every cron with more than one worker.
+#[sqlx::test(migrations = "./migrations")]
+async fn test_cron_does_not_warn_about_a_peer_publishing_the_occurrence(pool: PgPool) {
+    let db = TestDb::new(pool.clone()).await;
+    // Only the server's statement counts say when a pass found the row held, and so when the peer must commit.
+    let Some(mut stats) = Stats::new(&db.database).await else {
+        Stats::skipped("test_cron_does_not_warn_about_a_peer_publishing_the_occurrence");
+        return;
+    };
+    let key = "repro-peer-publication";
+    let worker = Worker::builder(db.queue.clone())
+        .schedule_cron_with_options(
+            "0 * * * *",
+            repro_cron_tick::job(()).dedupe_key(key),
+            skip_options(0, Duration::from_secs(60)),
+        )
+        .timers(WorkerTimers { schedule: Duration::from_secs(1), ..test_timers() })
+        .poll_interval(Duration::from_millis(20))
+        .build()
+        .unwrap();
+    let (warnings, _recording) = RecordedWarnings::start();
+    let shutdown = CancellationToken::new();
+    let run = tokio::spawn(worker.run_until(shutdown.clone()));
+
+    wait_until(Duration::from_secs(10), Duration::from_millis(10), "the cron was never reconciled", || async {
+        cron_next_run_at(&pool, db.queue.name(), key).await.is_some()
+    })
+    .await;
+
+    // The peer: it holds the row from before a pass reaches it until after that pass decides the row is contended,
+    // then advances the cursor an hour and commits, as publishing the occurrence does. The scheduler polls every
+    // second, so the next pass comes long after the commit. Counted from before the lock, since a pass that found the
+    // row held before the count began would make the one awaited the second.
+    let rechecks = stats.since_now(CRON_SCHEDULE_RECHECK).await;
+    let (mut peer, held) = hold_due_schedule(&pool, db.queue.name(), key).await;
+    let published = cron_job_count(&pool, db.queue.name(), key).await;
+    stats.wait_for_calls(&rechecks, 1, "no pass found the schedule row held").await;
+    let next = held + SignedDuration::from_hours(1);
+    sqlx::query("UPDATE pgqueue.cron_schedules SET next_run_at = $3 WHERE queue = $1 AND dedupe_key = $2")
+        .bind(db.queue.name())
+        .bind(key)
+        .bind(next.to_sqlx())
+        .execute(&mut *peer)
+        .await
+        .unwrap();
+    peer.commit().await.unwrap();
+
+    let passes = stats.since_now(CRON_DUE_FILTER).await;
+    stats.wait_for_calls(&passes, 2, "the scheduler stopped polling").await;
+    assert_eq!(warnings.count(OCCURRENCE_DEFERRED), 0, "a row held for one pass is a peer's publication");
+    assert_eq!(cron_job_count(&pool, db.queue.name(), key).await, published, "the peer published the occurrence");
+    assert_eq!(cron_next_run_at(&pool, db.queue.name(), key).await, Some(next), "and advanced the cursor");
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), run).await.unwrap().unwrap().unwrap();
+}
+
+/// Arms a reconciled cron's schedule to be due now and locks its row in a transaction, the way a peer publishing the
+/// occurrence or an outside session holds it. Returns the transaction and the armed cursor.
+///
+/// Arming the schedule and locking it are two transactions, and a scheduler tick fits between them: the tick claims
+/// the row first, publishes the occurrence and advances the cursor a whole hour, so the lock lands on a row that is no
+/// longer due. The scheduler then rolls back at its due check without ever reaching the claim, and a test waiting for
+/// that claim times out 30 seconds later — the setup losing a race, reported as the behaviour under test failing. The
+/// armed cursor comes back verbatim while nothing else has written the row, so an inequality is exactly "a tick got
+/// there first": drop the lock and arm it again.
+async fn hold_due_schedule(
+    pool: &PgPool,
+    queue: &str,
+    dedupe_key: &str,
+) -> (sqlx::Transaction<'static, sqlx::Postgres>, Timestamp) {
+    for _ in 0..10 {
+        let armed = set_cron_due(pool, queue, dedupe_key, None).await;
+        let mut holder = pool.begin().await.unwrap();
+        let held = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
+            "SELECT next_run_at FROM pgqueue.cron_schedules
+             WHERE queue = $1 AND dedupe_key = $2 FOR UPDATE",
+        )
+        .bind(queue)
+        .bind(dedupe_key)
+        .fetch_optional(&mut *holder)
+        .await
+        .unwrap()
+        .map(jiff_sqlx::Timestamp::to_jiff)
+        .expect("the reconciled schedule row");
+        if held == armed {
+            return (holder, held);
+        }
+        holder.rollback().await.unwrap();
+    }
+    panic!("the scheduler published the armed occurrence before the lock landed, ten times over");
+}
+
+/// Records the message of every warning logged while it is the default subscriber. Thread-local, and still sees a
+/// worker's scheduler, because `#[sqlx::test]` runs a current-thread runtime that polls every spawned task on this
+/// thread.
+#[derive(Clone, Default)]
+struct RecordedWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl RecordedWarnings {
+    /// Starts recording, returning the recorder and the guard that stops it.
+    fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let recorded = Self::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry::Registry::default().with(recorded.clone()));
+        (recorded, guard)
+    }
+
+    fn count(&self, message: &str) -> usize {
+        self.0.lock().expect("recorded warnings").iter().filter(|recorded| *recorded == message).count()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for RecordedWarnings {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut message = WarningMessage(String::new());
+        event.record(&mut message);
+        self.0.lock().expect("recorded warnings").push(message.0);
+    }
+}
+
+/// An event's message.
+struct WarningMessage(String);
+
+impl tracing::field::Visit for WarningMessage {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            value.clone_into(&mut self.0);
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
 }
 
 /// How many backends of this test's database wait on a lock while reconciling a cron.

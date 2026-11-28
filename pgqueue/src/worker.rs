@@ -68,6 +68,11 @@ const MAX_SWEEP_BEHIND_TICKS: u32 = 3;
 /// scheduler health degrades. One or two are ordinary peer contention; a run
 /// means the cron is making no progress and a warning alone is insufficient.
 const MAX_CRON_CONTENDED_TICKS: u32 = 3;
+/// Consecutive scheduling passes that must find the same due cron row locked before the scheduler warns. A peer holds
+/// the row only while its transaction publishes the occurrence, and the passes of workers sharing crons overlap on most
+/// occurrences, because each publishes every due cron in turn. So a pass that finds the row held once is ordinary, and
+/// the next one finds the occurrence published; a row still held then is held by something else.
+const CRON_CONTENDED_WARN_TICKS: u32 = 2;
 const DEQUEUE_RETRY_INITIAL_MAX_MS: u64 = 3;
 const DEQUEUE_RETRY_MAX_MS: u64 = 100;
 /// The most processors one worker may be configured to run. See the check in
@@ -3758,8 +3763,9 @@ async fn reconcile_crons_into(
             }
             // Another transaction held the schedule row for the whole wait
             // reconciliation allows it. Retried like a transient failure, and
-            // reported like the scheduler's own contention: a warning on the
-            // first pass of a run, and degraded health once the run persists.
+            // reported with a warning on the first pass of a run, since that
+            // wait already outlasted a peer's publication, and degraded health
+            // once the run persists.
             Ok(DatabaseCronAuthority::Contended) => {
                 state.unreconciled.insert(entry.dedupe_key.clone());
                 let ticks = state.contended.entry(entry.dedupe_key.clone()).or_default();
@@ -3872,12 +3878,14 @@ async fn schedule_crons_once(
             // (an operator's `SELECT ... FOR UPDATE`, a session left open in a
             // transaction) holds it indefinitely, and this arm was silent: no
             // log, no health change, the cursor frozen and the cron simply not
-            // firing for as long as it lasted. Warn on the first pass in each
-            // consecutive run, then let health carry a persistent one.
+            // firing for as long as it lasted. Warn once a run outlasts a peer's
+            // publication, which warning on its first pass reported on most
+            // occurrences of every cron with more than one worker, then let
+            // health carry a persistent one.
             Ok(DatabaseCronScheduleResult::Contended) => {
                 let ticks = state.contended.entry(entry.dedupe_key.clone()).or_default();
                 *ticks = ticks.saturating_add(1);
-                if *ticks == 1 {
+                if *ticks == CRON_CONTENDED_WARN_TICKS {
                     tracing::warn!(
                         cron = %entry.template.name,
                         dedupe_key = %entry.dedupe_key,

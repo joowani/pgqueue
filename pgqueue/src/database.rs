@@ -2660,7 +2660,9 @@ impl Database {
             // outcome of every multi-worker race for a due cron, and reporting it as contention logged "locked by
             // another transaction; occurrence deferred" for an occurrence that had just been published, on most
             // occurrences of every cron with more than one worker. A fresh statement sees the peer's commit, so a row
-            // still due here is one somebody holds. A burst waited for the lock instead, so its empty claim is not due.
+            // still due here is one somebody holds: a peer still publishing it, or an outside holder, which the
+            // scheduler tells apart by whether its next pass finds the row held again. A burst waited for the lock
+            // instead, so its empty claim is not due.
             let contended = through.is_none()
                 && sqlx::query_scalar::<_, bool>(
                     r#"
